@@ -1,3 +1,5 @@
+My personal fork of lycoris, not meant for deepwoken, main purpose is to have a universal auto parry builder (UAPB)
+
 # Lycoris-Rewrite
 
 Rewritten Lycoris - better logging, optimizations, error handling, faster prototyping, and more.
