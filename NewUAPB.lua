@@ -10,8 +10,7 @@
 	Storage layout (inside the executor workspace folder):
 		UAPB/Timings/<name>.json            saved timing files
 		UAPB/Configs/settings/*.json        Linoria SaveManager UI configs
-		UAPB/Games/<PlaceId>.json           per-game data (captured remotes, autoload timing name)
-		UAPB/Logs/animations_<PlaceId>.json logged animation ids
+		UAPB/Games/<PlaceId>.json           per-game data (captured remotes, blacklist, autoload timing name)
 		UAPB/Logs/difference_<PlaceId>_<time>.json exported difference samples
 ]]
 
@@ -66,6 +65,8 @@ local checkcaller = env("checkcaller")
 local getgc = env("getgc")
 local getrawmetatable = env("getrawmetatable")
 local identifyexecutor = env("identifyexecutor")
+local gethui = env("gethui")
+local setclipboard = env("setclipboard") or env("toclipboard")
 
 -- Linoria UI tables, assigned after the library loads.
 local Toggles
@@ -2492,13 +2493,74 @@ function Hitbox.effectiveSize(action, timing)
 end
 
 --------------------------------------------------------------------------------
+-- PlaybackData
+--------------------------------------------------------------------------------
+
+---@class PlaybackData
+---@field base number Timestamp of when the object was created.
+---@field ash table<number, number> Animation speed history. The key is the timestamp delta and the value is the speed at that point.
+---@field entity Model Entity to playback.
+local PlaybackData = {}
+PlaybackData.__index = PlaybackData
+
+---Get last exceeded speed difference from a timestamp delta.
+---@param from number
+---@return number?, number?
+function PlaybackData:last(from)
+	local latestExceededSpeed = nil
+	local latestExceededDelta = nil
+
+	for delta, speed in next, self.ash do
+		if from <= delta then
+			continue
+		end
+
+		if latestExceededDelta and delta <= latestExceededDelta then
+			continue
+		end
+
+		latestExceededSpeed = speed
+		latestExceededDelta = delta
+	end
+
+	return latestExceededSpeed, latestExceededDelta
+end
+
+---Track animation speed.
+---@param speed number
+function PlaybackData:astrack(speed)
+	local delta = os.clock() - self.base
+
+	if self:last(delta) == speed then
+		return
+	end
+
+	self.ash[delta] = speed
+end
+
+---Create new PlaybackData object.
+---@param entity Model
+---@return PlaybackData
+function PlaybackData.new(entity)
+	local self = setmetatable({}, PlaybackData)
+	self.base = os.clock()
+	self.entity = entity
+
+	---@note: Timestamp delta is how many seconds need to pass before being able to reach this speed.
+	self.ash = {}
+
+	return self
+end
+
+--------------------------------------------------------------------------------
 -- Forward declarations
 --------------------------------------------------------------------------------
 
 local Defense
-local AnimationLog
+local InfoLogger
 local DifferenceCalculator
 local Entities
+local AnimationVisualizer
 
 --------------------------------------------------------------------------------
 -- Entities (universal entity discovery)
@@ -2506,11 +2568,37 @@ local Entities
 
 ---@class Entities
 Entities = {
-	tracked = {}, -- model -> state { maid, humanoid, root, lastTrack, lastAt }
+	tracked = {}, -- model -> state { maid, humanoid, lastTrack, lastAt, pbdata, rpbdata }
+	deletedPlaybackData = {}, -- entity name -> rpbdata for removed entities
 	maid = Maid.new(),
 }
 
----Is a model a valid entity (Humanoid + HumanoidRootPart)?
+local DELETED_PLAYBACK_MAX = 50
+
+---Resolve an entity's root part. Works for NPCs without a HumanoidRootPart.
+---@param model any
+---@return BasePart?
+local function entityRoot(model)
+	if typeof(model) ~= "Instance" then
+		return nil
+	end
+
+	local humanoid = model:FindFirstChildOfClass("Humanoid")
+
+	if humanoid and humanoid.RootPart then
+		return humanoid.RootPart
+	end
+
+	local root = model:FindFirstChild("HumanoidRootPart")
+
+	if root then
+		return root
+	end
+
+	return model.PrimaryPart
+end
+
+---Is a model a valid entity? Requires a Humanoid, or an AnimationController with any root part.
 ---@param model any
 ---@return boolean
 local function isEntity(model)
@@ -2518,15 +2606,19 @@ local function isEntity(model)
 		return false
 	end
 
-	if not model:FindFirstChildOfClass("Humanoid") then
-		return false
+	if model:FindFirstChildOfClass("Humanoid") then
+		return true
 	end
 
-	if not model:FindFirstChild("HumanoidRootPart") then
-		return false
+	-- AnimationController-driven NPCs still need a root part to validate distance.
+	if
+		model:FindFirstChildOfClass("AnimationController")
+		and (model:FindFirstChild("HumanoidRootPart") or model.PrimaryPart)
+	then
+		return true
 	end
 
-	return true
+	return false
 end
 
 ---Distance between the local root and an entity.
@@ -2534,7 +2626,7 @@ end
 ---@return number?
 local function entityDistance(entity)
 	local localRoot = Input.localRoot()
-	local root = entity and entity:FindFirstChild("HumanoidRootPart")
+	local root = entity and entityRoot(entity)
 
 	if not localRoot or not root then
 		return nil
@@ -2573,15 +2665,16 @@ local function handleAnimationPlayed(entity, track)
 	state.lastTrack = track
 	state.lastAt = now
 
+	-- Record playback data for the animation visualizer (all animations, timing or not).
+	if Toggles and Toggles.ShowAnimationVisualizer and Toggles.ShowAnimationVisualizer.Value then
+		state.pbdata[track] = PlaybackData.new(entity)
+	end
+
 	local maxDistance = (Options and Options.MaxDetectionDistance and Options.MaxDetectionDistance.Value) or 300
 	local distance = entityDistance(entity)
 
 	if distance and distance > maxDistance then
 		return
-	end
-
-	if AnimationLog then
-		AnimationLog.log(entity, track)
 	end
 
 	if DifferenceCalculator then
@@ -2602,19 +2695,24 @@ local function hookEntity(entity)
 
 	local maid = Maid.new()
 	local humanoid = entity:FindFirstChildOfClass("Humanoid")
+	local controller = entity:FindFirstChildOfClass("AnimationController")
 
 	local state = {
 		maid = maid,
 		humanoid = humanoid,
 		lastTrack = nil,
 		lastAt = 0,
+		pbdata = {},
+		rpbdata = {},
 	}
 
 	Entities.tracked[entity] = state
 
-	-- Animation signals.
-	if humanoid then
-		maid:mark(humanoid.AnimationPlayed:Connect(function(track)
+	-- Animation signals (Humanoid or AnimationController as host).
+	local host = humanoid or controller
+
+	if host then
+		maid:mark(host.AnimationPlayed:Connect(function(track)
 			handleAnimationPlayed(entity, track)
 		end))
 	end
@@ -2629,18 +2727,22 @@ local function hookEntity(entity)
 		end))
 	end
 
-	if humanoid then
-		local animator = humanoid:FindFirstChildOfClass("Animator")
+	local animator = entity:FindFirstChildWhichIsA("Animator", true)
 
-		if animator then
-			hookAnimator(animator)
-		else
-			maid:mark(humanoid.ChildAdded:Connect(function(child)
-				if child:IsA("Animator") then
-					hookAnimator(child)
-				end
-			end))
-		end
+	if animator then
+		hookAnimator(animator)
+	elseif host then
+		maid:mark(host.ChildAdded:Connect(function(child)
+			if child:IsA("Animator") then
+				hookAnimator(child)
+			end
+		end))
+
+		maid:mark(entity.DescendantAdded:Connect(function(child)
+			if child:IsA("Animator") then
+				hookAnimator(child)
+			end
+		end))
 	end
 
 	-- Effect / sound descendant detection.
@@ -2677,12 +2779,26 @@ local function hookEntity(entity)
 		end
 	end
 
-	-- Cleanup when the entity is removed.
+	-- Cleanup when the entity is removed; keep its recorded playback data around.
 	maid:mark(entity.AncestryChanged:Connect(function()
 		if not entity:IsDescendantOf(workspace) then
 			local tracked = Entities.tracked[entity]
 
 			if tracked then
+				if next(tracked.rpbdata) then
+					Entities.deletedPlaybackData[entity.Name] = tracked.rpbdata
+
+					local count = 0
+					for _ in next, Entities.deletedPlaybackData do
+						count = count + 1
+					end
+
+					if count > DELETED_PLAYBACK_MAX then
+						local firstKey = next(Entities.deletedPlaybackData)
+						Entities.deletedPlaybackData[firstKey] = nil
+					end
+				end
+
 				tracked.maid:clean()
 				Entities.tracked[entity] = nil
 			end
@@ -2773,7 +2889,7 @@ function Entities.nearest(position)
 	local best, bestDistance = nil, math.huge
 
 	for model in next, Entities.tracked do
-		local root = model:FindFirstChild("HumanoidRootPart")
+		local root = entityRoot(model)
 
 		if root then
 			local distance = (root.Position - position).Magnitude
@@ -2788,143 +2904,1163 @@ function Entities.nearest(position)
 	return best
 end
 
+---Track animation speeds for the visualizer every Heartbeat.
+function Entities.trackPlayback()
+	local enabled = Toggles and Toggles.ShowAnimationVisualizer and Toggles.ShowAnimationVisualizer.Value
+
+	for _, state in next, Entities.tracked do
+		for track, data in next, state.pbdata do
+			if not enabled then
+				state.pbdata[track] = nil
+				continue
+			end
+
+			if not track.IsPlaying then
+				state.pbdata[track] = nil
+				state.rpbdata[tostring(track.Animation and track.Animation.AnimationId or "")] = data
+				continue
+			end
+
+			data:astrack(track.Speed)
+		end
+	end
+end
+
+---Get recorded playback data for an animation id.
+---@param aid string
+---@return PlaybackData?
+function Entities.agpd(aid)
+	local normalized = normalizeAssetId(aid)
+
+	-- Grab from 'rpbdata' — data there has been fully recorded.
+	for _, state in next, Entities.tracked do
+		local data = state.rpbdata[aid] or state.rpbdata[normalized]
+
+		if data then
+			return data
+		end
+	end
+
+	-- Fallback to deleted playback data.
+	for _, rpbdata in next, Entities.deletedPlaybackData do
+		local data = rpbdata[aid] or rpbdata[normalized]
+
+		if data then
+			return data
+		end
+	end
+
+	return nil
+end
+
 --------------------------------------------------------------------------------
--- AnimationLog
+-- ScreenGui helper
 --------------------------------------------------------------------------------
 
----@class AnimationLog
-AnimationLog = {
-	entries = {}, -- ring buffer, most recent last
-	seen = {}, -- id -> {name, entity, count, last}
-	dirty = false,
-	lastFlush = 0,
-	fs = nil,
+---Create a ScreenGui parented to a hidden/core UI container.
+---@param name string
+---@return ScreenGui
+local function createScreenGui(name)
+	local gui = Instance.new("ScreenGui")
+	gui.Name = name
+	gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+	local parented = false
+
+	if gethui then
+		parented = pcall(function()
+			gui.Parent = gethui()
+		end)
+	end
+
+	if not parented then
+		parented = pcall(function()
+			gui.Parent = game:GetService("CoreGui")
+		end)
+	end
+
+	if not parented and localPlayer then
+		pcall(function()
+			gui.Parent = localPlayer:FindFirstChildOfClass("PlayerGui")
+		end)
+	end
+
+	return gui
+end
+
+--------------------------------------------------------------------------------
+-- InfoLogger
+--------------------------------------------------------------------------------
+
+---@class InfoLogger
+InfoLogger = {
+	Cycles = { "Animation", "Part", "Sound", "Effect" },
+	Cycle = 1,
+	Data = {
+		MissingDataEntries = {},
+		KeyBlacklistHistory = {},
+		KeyBlacklistList = {},
+	},
+	queue = {},
+	frame = nil,
+	label = nil,
+	container = nil,
+	lastClickedKey = nil,
 }
 
----@return Filesystem?
-local function logsFs()
-	if not FS_AVAILABLE then
+---Current key blacklist (persisted per game).
+---@return table
+local function blacklist()
+	GameData.data.blacklist = GameData.data.blacklist or {}
+	InfoLogger.Data.KeyBlacklistList = GameData.data.blacklist
+	return InfoLogger.Data.KeyBlacklistList
+end
+
+---Persist the blacklist.
+local function saveBlacklist()
+	GameData.data.blacklist = InfoLogger.Data.KeyBlacklistList
+	GameData.save()
+end
+
+---@return string[]
+function InfoLogger.keyBlacklists()
+	local tbl = {}
+
+	for key, val in next, blacklist() do
+		if not val then
+			continue
+		end
+
+		tbl[#tbl + 1] = key
+	end
+
+	return tbl
+end
+
+---Refresh the info logger entries.
+function InfoLogger.refresh()
+	local currentType = InfoLogger.Cycles[InfoLogger.Cycle]
+	local blacklistList = blacklist()
+
+	for idx, entry in next, InfoLogger.Data.MissingDataEntries do
+		if not blacklistList[entry.Key] then
+			continue
+		end
+
+		table.remove(InfoLogger.Data.MissingDataEntries, idx)
+		pcall(entry.Label.Destroy, entry.Label)
+	end
+
+	for idx, entry in next, InfoLogger.Data.MissingDataEntries do
+		entry.Label.Parent = entry.Type == currentType and InfoLogger.container or nil
+		entry.Label.LayoutOrder = idx
+	end
+
+	InfoLogger.label.Text = string.format("Info Logger (%s)", currentType)
+
+	local ySize = 0
+	local xSize = 0
+
+	for _, entry in next, InfoLogger.Data.MissingDataEntries do
+		if not entry.Label.Parent then
+			continue
+		end
+
+		ySize = ySize + entry.Label.TextBounds.Y + 2
+
+		if entry.Label.TextBounds.X <= xSize then
+			continue
+		end
+
+		xSize = entry.Label.TextBounds.X
+	end
+
+	xSize = xSize + 20
+	ySize = ySize + 22
+
+	InfoLogger.frame.Size = UDim2.new(0, math.clamp(xSize, 210, 800), 0, math.clamp(ySize, 24, 180))
+end
+
+---Queue a miss entry. One queued entry is processed per RenderStepped; the queue is
+---discarded while the logger is hidden.
+---@param type string
+---@param key string
+---@param name string?
+---@param distance number
+---@param parent string?
+function InfoLogger.addMissEntry(entryType, key, name, distance, parent)
+	local ifd = InfoLogger.Data
+	local mde = ifd.MissingDataEntries
+	local bl = blacklist()
+
+	if bl[key] then
+		return
+	end
+
+	table.insert(InfoLogger.queue, 1, function()
+		local function getEntriesForThisType()
+			local entries = {}
+
+			for idx, entry in next, mde do
+				if entry.Type == entryType then
+					table.insert(entries, { entry, idx })
+				end
+			end
+
+			return entries
+		end
+
+		-- Pop the last element if we're over 30 entries for this type.
+		local entries = getEntriesForThisType()
+		local last = entries[#entries]
+
+		if #entries > 30 and last then
+			last[1].Label:Destroy()
+			table.remove(mde, last[2])
+		end
+
+		local asset = typeof(key) == "string" and tonumber(normalizeAssetId(key):match("%d+")) or nil
+
+		-- Create a new label.
+		local label = Library:CreateLabel({
+			Text = name and string.format("(%.2fm away) Key '%s' from '%s' is missing.", distance, key, name)
+				or string.format("(%.2fm away) Key '%s' is missing.", distance, key),
+			TextXAlignment = Enum.TextXAlignment.Left,
+			Size = UDim2.new(1, 0, 0, 14),
+			LayoutOrder = 1,
+			TextSize = 12,
+			Visible = true,
+			ZIndex = 306,
+			Parent = nil,
+		}, true)
+
+		if parent then
+			label.Text = string.format("(%s) %s", parent, label.Text)
+		end
+
+		Library:AddToRegistry(label, {
+			TextColor3 = "FontColor",
+		}, true)
+
+		if asset then
+			task.spawn(function()
+				pcall(function()
+					local info = game:GetService("MarketplaceService"):GetProductInfo(asset)
+
+					if not info then
+						return
+					end
+
+					label.Text = string.format("(%s) %s", info.Name, label.Text)
+				end)
+			end)
+		end
+
+		-- entry
+		local entry = { Label = label, Key = key, Type = entryType }
+
+		-- Copy & blacklist.
+		label.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.MouseButton1 then
+				InfoLogger.lastClickedKey = key
+
+				if setclipboard then
+					setclipboard(key)
+				end
+
+				Library:Notify(string.format("Copied key '%s' to clipboard.", key))
+			end
+
+			if input.UserInputType == Enum.UserInputType.MouseButton2 then
+				blacklist()[key] = true
+				ifd.KeyBlacklistHistory[#ifd.KeyBlacklistHistory + 1] = key
+				saveBlacklist()
+				InfoLogger.refresh()
+
+				if Options and Options.BlacklistedKeys then
+					Options.BlacklistedKeys:SetValues(InfoLogger.keyBlacklists())
+				end
+
+				Library:Notify(string.format("Blacklisted key '%s' from list.", key))
+			end
+		end)
+
+		-- Create a new entry for later destroying.
+		table.insert(mde, 1, entry)
+
+		-- Refresh.
+		InfoLogger.refresh()
+	end)
+end
+
+---Process one queued miss entry per RenderStepped; discard the queue while hidden.
+function InfoLogger.renderStepped()
+	if not InfoLogger.frame or not InfoLogger.frame.Visible then
+		table.clear(InfoLogger.queue)
+		return
+	end
+
+	local work = table.remove(InfoLogger.queue)
+
+	if work then
+		work()
+	end
+end
+
+---Log a miss, gated by the window visibility and distance sliders.
+---@param entryType string
+---@param key string
+---@param name string?
+---@param distance number
+---@param parent string?
+---@return boolean
+function InfoLogger.miss(entryType, key, name, distance, parent)
+	if not (Toggles and Toggles.ShowLoggerWindow and Toggles.ShowLoggerWindow.Value) then
+		return false
+	end
+
+	local minDistance = (Options and Options.MinimumLoggerDistance and Options.MinimumLoggerDistance.Value) or 0
+	local maxDistance = (Options and Options.MaximumLoggerDistance and Options.MaximumLoggerDistance.Value) or 1000
+
+	if distance and (distance < minDistance or distance > maxDistance) then
+		return false
+	end
+
+	InfoLogger.addMissEntry(entryType, key, name, distance or 0, parent)
+	return true
+end
+
+---Set the logger window visibility.
+---@param state boolean
+function InfoLogger.visible(state)
+	if InfoLogger.frame then
+		InfoLogger.frame.Visible = state
+	end
+end
+
+---Build the Info Logger window (requires the Linoria library to be loaded).
+function InfoLogger.init()
+	local screenGui = createScreenGui("UAPB_InfoLogger")
+	InfoLogger.screenGui = screenGui
+
+	blacklist()
+
+	local outer = Library:Create("Frame", {
+		BorderColor3 = Color3.new(0, 0, 0),
+		Position = UDim2.new(0, 15, 0.5, 0),
+		Size = UDim2.new(0, 210, 0, 20),
+		Visible = false,
+		ZIndex = 287,
+		Parent = screenGui,
+	})
+
+	local inner = Library:Create("Frame", {
+		BackgroundColor3 = Library.MainColor,
+		BorderColor3 = Library.OutlineColor,
+		BorderMode = Enum.BorderMode.Inset,
+		Size = UDim2.new(1, 0, 1, 0),
+		ZIndex = 288,
+		Parent = outer,
+	})
+
+	Library:AddToRegistry(inner, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "OutlineColor",
+	}, true)
+
+	local colorFrame = Library:Create("Frame", {
+		BackgroundColor3 = Library.AccentColor,
+		BorderSizePixel = 0,
+		Size = UDim2.new(1, 0, 0, 2),
+		ZIndex = 299,
+		Parent = inner,
+	})
+
+	Library:AddToRegistry(colorFrame, {
+		BackgroundColor3 = "AccentColor",
+	}, true)
+
+	local loggerLabel = Library:CreateLabel({
+		Size = UDim2.new(1, 0, 0, 20),
+		Position = UDim2.fromOffset(5, 2),
+		TextXAlignment = Enum.TextXAlignment.Left,
+		TextColor3 = Library.AccentColor,
+		Text = "Info Logger",
+		TextSize = 14,
+		ZIndex = 300,
+		Parent = inner,
+	})
+
+	Library:AddToRegistry(loggerLabel, {
+		TextColor3 = "AccentColor",
+	}, true)
+
+	local container = Library:Create("ScrollingFrame", {
+		BackgroundTransparency = 1,
+		Size = UDim2.new(1, 0, 1, -20),
+		Position = UDim2.new(0, 0, 0, 20),
+		ZIndex = 1,
+		ScrollBarThickness = 0,
+		Parent = inner,
+	})
+
+	local listLayout = Library:Create("UIListLayout", {
+		FillDirection = Enum.FillDirection.Vertical,
+		SortOrder = Enum.SortOrder.LayoutOrder,
+		Parent = container,
+	})
+
+	listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+		container.CanvasSize = UDim2.fromOffset(0, listLayout.AbsoluteContentSize.Y)
+	end)
+
+	Library:Create("UIPadding", {
+		PaddingLeft = UDim.new(0, 5),
+		Parent = container,
+	})
+
+	rootMaid:mark(outer.InputBegan:Connect(function(inputObject)
+		if inputObject.UserInputType ~= Enum.UserInputType.Keyboard then
+			return
+		end
+
+		if inputObject.KeyCode == Enum.KeyCode.Z and userInputService:IsKeyDown(Enum.KeyCode.LeftControl) then
+			local history = InfoLogger.Data.KeyBlacklistHistory
+			local front = history[1]
+
+			if not front then
+				return
+			end
+
+			blacklist()[front] = nil
+			table.remove(history, 1)
+			saveBlacklist()
+			InfoLogger.refresh()
+
+			if Options and Options.BlacklistedKeys then
+				Options.BlacklistedKeys:SetValues(InfoLogger.keyBlacklists())
+			end
+
+			Library:Notify(string.format("Re-whitelisted key '%s' into list.", front))
+		end
+
+		if inputObject.KeyCode == Enum.KeyCode.Q then
+			InfoLogger.Cycle = math.max(InfoLogger.Cycle - 1, 1)
+			InfoLogger.refresh()
+		end
+
+		if inputObject.KeyCode == Enum.KeyCode.E then
+			InfoLogger.Cycle = math.min(InfoLogger.Cycle + 1, #InfoLogger.Cycles)
+			InfoLogger.refresh()
+		end
+	end))
+
+	InfoLogger.label = loggerLabel
+	InfoLogger.frame = outer
+	InfoLogger.container = container
+	InfoLogger.Cycle = 1
+
+	Library:MakeDraggable(outer)
+	InfoLogger.refresh()
+end
+
+---Destroy the Info Logger window.
+function InfoLogger.detach()
+	if InfoLogger.screenGui then
+		pcall(function()
+			InfoLogger.screenGui:Destroy()
+		end)
+
+		InfoLogger.screenGui = nil
+	end
+end
+
+--------------------------------------------------------------------------------
+-- AnimationVisualizer
+--------------------------------------------------------------------------------
+
+---@note: This code is UI code. It is ugly on purpose and lazily made.
+---@class AnimationVisualizer
+AnimationVisualizer = {}
+
+local visualizerMaid = Maid.new()
+
+local visualizerScreenGui = nil
+local outer = nil
+local inner = nil
+local animationVisualizerLabel = nil
+local sliderOuter = nil
+local sliderText = nil
+local sliderFill = nil
+local hideBorderRight = nil
+local frameBackwards = nil
+local icon = nil
+local playStop = nil
+local iconTwo = nil
+local viewportFrame = nil
+local worldModel = nil
+local camera = nil
+local speedText = nil
+local noViewportFrame = nil
+local textLabel = nil
+local colorFrame = nil
+local frameForwards = nil
+local iconThree = nil
+local animationTextbox = nil
+
+-- Current data for playback loop.
+local currentPlaybackData = nil
+local currentTrack = nil
+local isPaused = false
+local timeElapsed = 0.0
+
+---Map slider value.
+---@param value number
+---@param min number
+---@param max number
+---@param minSize number
+---@param maxSize number
+local function mapSliderValue(value, min, max, minSize, maxSize)
+	return (1 - ((value - min) / (max - min))) * minSize + ((value - min) / (max - min)) * maxSize
+end
+
+---On Animation ID focus lost.
+---@param enter boolean
+local function onIdFocusLost(enter)
+	if not enter then
+		return
+	end
+
+	-- Empty out previous data.
+	currentTrack = nil
+	currentPlaybackData = nil
+
+	---@type PlaybackData
+	local playbackData = Entities.agpd(animationTextbox.Text)
+
+	if not playbackData then
+		return AnimationVisualizer.message("No Playback Data Found")
+	end
+
+	-- Remove all previously loaded models.
+	for _, descendant in next, viewportFrame:GetDescendants() do
+		if descendant.ClassName ~= "Model" then
+			continue
+		end
+
+		descendant:Destroy()
+	end
+
+	-- Load the model & center it.
+	local entity = playbackData.entity:Clone()
+	entity.Parent = worldModel
+	entity:PivotTo(CFrame.new(0, 0, 0))
+
+	-- Fetch the primary part. If it does not exist, then the entity has been unloaded.
+	if not entity.PrimaryPart then
+		return AnimationVisualizer.message("No Primary Part Found")
+	end
+
+	-- Setup camera.
+	local _, bbs = entity:GetBoundingBox()
+	camera.CFrame =
+		CFrame.lookAt(entity.PrimaryPart.Position - Vector3.new(0, 0, bbs.Magnitude), entity.PrimaryPart.Position)
+
+	-- Fetch animator.
+	local animator = entity:FindFirstChildWhichIsA("Animator", true)
+
+	if not animator then
+		return AnimationVisualizer.message("No Animator Found")
+	end
+
+	-- Stop previous animations.
+	for _, track in next, animator:GetPlayingAnimationTracks() do
+		track:Stop()
+	end
+
+	-- Create animation.
+	local animation = Instance.new("Animation")
+	animation.AnimationId = animationTextbox.Text
+
+	-- Store current data for playback.
+	currentPlaybackData = playbackData
+	currentTrack = animator:LoadAnimation(animation)
+
+	-- Play animation and keep it at zero speed.
+	currentTrack:Play(0.0, 100, 0.0)
+	currentTrack.Priority = Enum.AnimationPriority.Action
+	currentTrack.Looped = true
+	visualizerMaid:mark(currentTrack.DidLoop:Connect(function()
+		timeElapsed = 0.0
+	end))
+
+	-- Reset time elapsed.
+	timeElapsed = 0.0
+
+	-- Show frames.
+	viewportFrame.Visible = true
+	noViewportFrame.Visible = false
+end
+
+---Get time elapsed from time position.
+---@param timePosition number
+---@param animationLength number
+---@return number?
+local function getTimeElapsedFromTp(timePosition, animationLength)
+	if not currentPlaybackData then
 		return nil
 	end
 
-	AnimationLog.fs = AnimationLog.fs or Filesystem.new(LOGS_FOLDER)
-	return AnimationLog.fs
-end
-
----Load the persisted seen map.
-function AnimationLog.load()
-	local fs = logsFs()
-
-	if not fs then
-		return
+	if timePosition <= 0 then
+		return 0.0
 	end
 
-	pcall(function()
-		local file = "animations_" .. tostring(placeId) .. ".json"
+	-- Numerical integration to find elapsed time.
+	local currentPos = 0
+	local elapsed = 0
+	local dt = 0.01
+	local iterations = 0
 
-		if fs:file(file) then
-			AnimationLog.seen = httpService:JSONDecode(fs:read(file)) or {}
+	while currentPos < timePosition do
+		local speed = currentPlaybackData:last(elapsed) or 1
+		local stepSize = speed * dt
+
+		iterations = iterations + 1
+
+		---@note: The iteration budget is the animation length at dt=0.01s times a 10x buffer; minimum 1000.
+		if iterations >= math.max(animationLength * 100 * 10, 1000) then
+			break
 		end
-	end)
+
+		-- If adding the full step would exceed the target position, calculate partial step and break.
+		if currentPos + stepSize > timePosition then
+			local remainingTime = (timePosition - currentPos) / speed
+			elapsed = elapsed + remainingTime
+			break
+		end
+
+		currentPos = currentPos + stepSize
+		elapsed = elapsed + dt
+	end
+
+	-- Return the elapsed time.
+	return elapsed
 end
 
----Flush the seen map to disk if dirty (call every Heartbeat; writes are debounced).
-function AnimationLog.flush()
-	if not AnimationLog.dirty then
+---On playback loop.
+---@param delta number
+local function onPlaybackLoop(delta)
+	if not visualizerScreenGui or not visualizerScreenGui.Enabled then
 		return
 	end
 
-	if os.clock() - AnimationLog.lastFlush < 5 then
+	iconTwo.Image = isPaused and "rbxassetid://10734923549" or "rbxassetid://10734919336"
+
+	-- Run slider calculations.
+	local mhs = sliderOuter.AbsoluteSize.X
+	local hs = currentTrack and mapSliderValue(currentTrack.TimePosition, 0.0, currentTrack.Length, 0, mhs) or 0.0
+
+	-- Update slider text.
+	sliderText.Text = (currentTrack and currentPlaybackData)
+			and string.format(
+				"%.3f/%.3f (%ims)",
+				currentTrack.TimePosition,
+				currentTrack.Length,
+				math.round((getTimeElapsedFromTp(currentTrack.TimePosition, currentTrack.Length) or 0.0) * 1000)
+			)
+		or "0.000 / ??? (???ms)"
+
+	-- Update size.
+	sliderFill.Visible = not (hs == 0)
+	sliderFill.Size = UDim2.new(0, math.max(math.ceil(hs), 1), 1, 0)
+	hideBorderRight.Visible = not (hs == mhs or hs == 0)
+
+	-- Update speed amount.
+	speedText.Text = currentTrack and string.format("Speed (%.2f)", currentTrack.Speed) or "Speed (???)"
+
+	if currentTrack and isPaused then
+		speedText.Text = string.format(
+			"Speed (%.2f)",
+			currentPlaybackData:last(getTimeElapsedFromTp(currentTrack.TimePosition, currentTrack.Length) or 0.0) or 0.0
+		)
+	end
+
+	if not currentTrack or not currentPlaybackData then
 		return
 	end
 
-	local fs = logsFs()
-
-	if not fs then
-		return
+	if isPaused then
+		return currentTrack:AdjustSpeed(0.0)
 	end
 
-	AnimationLog.lastFlush = os.clock()
-	AnimationLog.dirty = false
+	timeElapsed = timeElapsed + delta
 
-	pcall(function()
-		fs:write("animations_" .. tostring(placeId) .. ".json", httpService:JSONEncode(AnimationLog.seen))
-	end)
+	currentTrack:AdjustSpeed(currentPlaybackData:last(timeElapsed) or 0.0)
 end
 
----Record a played animation.
----@param entity Model
----@param track AnimationTrack
-function AnimationLog.log(entity, track)
-	if not track or not track.Animation then
+---Toggle play stop function.
+local function togglePlayStop()
+	if not currentTrack then
 		return
 	end
 
-	if not (Toggles and Toggles.AnimationLogger and Toggles.AnimationLogger.Value) then
+	if not currentTrack.IsPlaying then
 		return
 	end
 
-	if
-		Toggles
-		and Toggles.IgnoreCoreAnimations
-		and Toggles.IgnoreCoreAnimations.Value
-		and track.Priority == Enum.AnimationPriority.Core
-	then
-		return
-	end
-
-	local id = normalizeAssetId(track.Animation.AnimationId)
-
-	table.insert(AnimationLog.entries, {
-		id = id,
-		name = track.Animation.Name,
-		entity = entity and entity.Name or "?",
-		at = os.clock(),
-		speed = track.Speed,
-		priority = tostring(track.Priority),
-	})
-
-	if #AnimationLog.entries > 200 then
-		table.remove(AnimationLog.entries, 1)
-	end
-
-	local seen = AnimationLog.seen[id]
-
-	if seen then
-		seen.count = (seen.count or 0) + 1
-		seen.last = os.time()
-		seen.name = track.Animation.Name
-		seen.entity = entity and entity.Name or "?"
-	else
-		AnimationLog.seen[id] = {
-			name = track.Animation.Name,
-			entity = entity and entity.Name or "?",
-			count = 1,
-			last = os.time(),
-		}
-	end
-
-	AnimationLog.dirty = true
+	isPaused = not isPaused
 end
 
----Refresh the UI dropdown values, most recent first.
----@param dropdown table
-function AnimationLog.refreshDropdown(dropdown)
-	local values = {}
-
-	for idx = #AnimationLog.entries, 1, -1 do
-		local entry = AnimationLog.entries[idx]
-		table.insert(values, string.format("%s | %s | %s", entry.id, entry.name, entry.entity))
+---Go backwards one frame.
+local function onFrameBackwards()
+	if not currentTrack then
+		return
 	end
 
-	dropdown:SetValues(values)
+	currentTrack.TimePosition = math.max(currentTrack.TimePosition - 0.01, 0)
 end
 
----Clear the log.
-function AnimationLog.clear()
-	table.clear(AnimationLog.entries)
-	table.clear(AnimationLog.seen)
-	AnimationLog.dirty = true
+---Go forwards one frame.
+local function onFrameForwards()
+	if not currentTrack then
+		return
+	end
+
+	currentTrack.TimePosition = math.min(currentTrack.TimePosition + 0.01, currentTrack.Length)
+end
+
+---On slider input began.
+---@param input InputObject
+---@param gameProcessed boolean
+local function onSliderInputBegan(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+
+	if input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+		return
+	end
+
+	while visualizerScreenGui.Enabled and userInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) do
+		if not currentTrack then
+			return
+		end
+
+		-- Pause track.
+		isPaused = true
+
+		-- Calculate new time position.
+		local mouse = localPlayer:GetMouse()
+		local sliderOuterSize = sliderOuter.AbsoluteSize.X
+		local mouseX = math.clamp(mouse.X - sliderOuter.AbsolutePosition.X, 0, sliderOuterSize)
+		local newTimePosition = mapSliderValue(mouseX, 0, sliderOuterSize, 0, currentTrack.Length)
+
+		-- Update time position.
+		currentTrack.TimePosition = newTimePosition
+
+		-- Wait.
+		runService.PreRender:Wait()
+	end
+
+	timeElapsed = getTimeElapsedFromTp(currentTrack.TimePosition, currentTrack.Length) or 0.0
+end
+
+---Outer input began.
+---@param input InputObject
+---@param gameProcessed boolean
+local function outerFrameInputBegan(input, gameProcessed)
+	if gameProcessed then
+		return
+	end
+
+	if input.KeyCode == Enum.KeyCode.Space then
+		return togglePlayStop()
+	end
+
+	if input.KeyCode == Enum.KeyCode.Right then
+		return onFrameForwards()
+	end
+
+	if input.KeyCode == Enum.KeyCode.Left then
+		return onFrameBackwards()
+	end
+end
+
+---Set the visibility of the AnimationVisualizer.
+---@param state boolean
+function AnimationVisualizer.visible(state)
+	if visualizerScreenGui then
+		visualizerScreenGui.Enabled = state
+	end
+end
+
+---Show a message.
+---@param message string
+function AnimationVisualizer.message(message)
+	viewportFrame.Visible = false
+	noViewportFrame.Visible = true
+	textLabel.Text = message
+end
+
+---Initialize AnimationVisualizer module (requires the Linoria library).
+function AnimationVisualizer.init()
+	visualizerScreenGui = createScreenGui("AnimationVisualizer")
+	visualizerScreenGui.Enabled = false
+	visualizerScreenGui.DisplayOrder = 1
+
+	outer = Instance.new("Frame")
+	outer.Name = "Outer"
+	outer.BackgroundColor3 = Color3.new(1, 1, 1)
+	outer.Position = UDim2.new(0.27, 0, 0.216, 0)
+	outer.BorderColor3 = Color3.new()
+	outer.Size = UDim2.new(0, 260, 0, 301.75)
+	outer.ZIndex = 100
+	outer.Parent = visualizerScreenGui
+
+	inner = Instance.new("Frame")
+	inner.Name = "Inner"
+	inner.BackgroundColor3 = Library.MainColor
+	inner.BorderMode = Enum.BorderMode.Inset
+	inner.BorderColor3 = Library.OutlineColor
+	inner.Size = UDim2.new(1, 0, 1, 0)
+	inner.Parent = outer
+
+	animationVisualizerLabel = Instance.new("TextLabel")
+	animationVisualizerLabel.Name = "AnimationVisualizer"
+	animationVisualizerLabel.FontFace = Font.new("rbxasset://fonts/families/RobotoMono.json")
+	animationVisualizerLabel.TextColor3 = Library.AccentColor
+	animationVisualizerLabel.Text = "Animation Visualizer"
+	animationVisualizerLabel.BackgroundColor3 = Color3.new()
+	animationVisualizerLabel.BorderSizePixel = 0
+	animationVisualizerLabel.BackgroundTransparency = 1
+	animationVisualizerLabel.Position = UDim2.new(0, 5, 0, 5)
+	animationVisualizerLabel.TextXAlignment = Enum.TextXAlignment.Left
+	animationVisualizerLabel.BorderColor3 = Color3.new()
+	animationVisualizerLabel.TextSize = 17
+	animationVisualizerLabel.Size = UDim2.new(1, 0, 0, 20)
+	animationVisualizerLabel.Parent = inner
+
+	sliderOuter = Instance.new("Frame")
+	sliderOuter.Name = "SliderOuter"
+	sliderOuter.BackgroundColor3 = Color3.new(1, 1, 1)
+	sliderOuter.Position = UDim2.new(0.323, -78, 0.835, 24)
+	sliderOuter.BorderColor3 = Color3.new()
+	sliderOuter.BorderSizePixel = 0
+	sliderOuter.Size = UDim2.new(0, 247, 0, 15)
+	sliderOuter.Parent = inner
+
+	sliderText = Instance.new("TextLabel")
+	sliderText.Name = "SliderText"
+	sliderText.FontFace = Font.new("rbxasset://fonts/families/RobotoMono.json")
+	sliderText.TextColor3 = Library.FontColor
+	sliderText.Text = "0.000 / ? (?ms)"
+	sliderText.BackgroundTransparency = 1
+	sliderText.BackgroundColor3 = Color3.new(1, 1, 1)
+	sliderText.BorderSizePixel = 0
+	sliderText.BorderColor3 = Color3.new()
+	sliderText.TextSize = 12
+	sliderText.ZIndex = 12
+	sliderText.Size = UDim2.new(1, 0, 1, 0)
+	sliderText.Parent = sliderOuter
+
+	sliderFill = Instance.new("Frame")
+	sliderFill.Name = "SliderFill"
+	sliderFill.BorderMode = Enum.BorderMode.Inset
+	sliderFill.BorderColor3 = Library.AccentColorDark
+	sliderFill.BackgroundColor3 = Library.AccentColor
+	sliderFill.Size = UDim2.new(0, 1, 1, 0)
+	sliderFill.ZIndex = 10
+	sliderFill.Parent = sliderOuter
+
+	hideBorderRight = Instance.new("Frame")
+	hideBorderRight.Name = "HideBorderRight"
+	hideBorderRight.BackgroundColor3 = Library.AccentColor
+	hideBorderRight.Position = UDim2.new(1, 0, 0, 0)
+	hideBorderRight.BorderColor3 = Color3.new()
+	hideBorderRight.BorderSizePixel = 0
+	hideBorderRight.Size = UDim2.new(0, 1, 1, 0)
+	hideBorderRight.Parent = sliderFill
+	hideBorderRight.Visible = false
+
+	local sliderInner = Instance.new("Frame")
+	sliderInner.Name = "SliderInner"
+	sliderInner.BorderColor3 = Color3.new()
+	sliderInner.BackgroundColor3 = Library.MainColor
+	sliderInner.Size = UDim2.new(1, 0, 1, 0)
+	sliderInner.Parent = sliderOuter
+
+	frameBackwards = Instance.new("TextButton")
+	frameBackwards.Name = "FrameBackwards"
+	frameBackwards.FontFace = Font.new("rbxasset://fonts/families/SourceSansPro.json")
+	frameBackwards.TextColor3 = Color3.new()
+	frameBackwards.Text = ""
+	frameBackwards.Position = UDim2.new(0.323, -78, 0.835, -2)
+	frameBackwards.BackgroundColor3 = Library.MainColor
+	frameBackwards.BorderColor3 = Color3.new()
+	frameBackwards.TextSize = 14
+	frameBackwards.Size = UDim2.new(0, 70, 0, 20)
+	frameBackwards.Parent = inner
+
+	icon = Instance.new("ImageLabel")
+	icon.Name = "Icon"
+	icon.ScaleType = Enum.ScaleType.Crop
+	icon.BorderColor3 = Color3.new()
+	icon.BackgroundColor3 = Library.FontColor
+	icon.Image = "rbxassetid://10734961526"
+	icon.BackgroundTransparency = 1
+	icon.Position = UDim2.new(0.5, -8, 0.5, -8)
+	icon.SizeConstraint = Enum.SizeConstraint.RelativeXX
+	icon.BorderSizePixel = 0
+	icon.Size = UDim2.new(0, 16, 0, 16)
+	icon.Parent = frameBackwards
+
+	playStop = Instance.new("TextButton")
+	playStop.Name = "PlayStop"
+	playStop.FontFace = Font.new("rbxasset://fonts/families/SourceSansPro.json")
+	playStop.TextColor3 = Color3.new()
+	playStop.BorderColor3 = Color3.new()
+	playStop.Text = ""
+	playStop.Position = UDim2.new(0.323, 0, 0.835, -2)
+	playStop.BackgroundColor3 = Library.MainColor
+	playStop.TextSize = 14
+	playStop.Size = UDim2.new(0, 91, 0, 20)
+	playStop.Parent = inner
+
+	iconTwo = Instance.new("ImageLabel")
+	iconTwo.Name = "Icon"
+	iconTwo.BorderColor3 = Color3.new()
+	iconTwo.BackgroundColor3 = Library.FontColor
+	iconTwo.Image = "rbxassetid://10734919336"
+	iconTwo.BackgroundTransparency = 1
+	iconTwo.Position = UDim2.new(0.5, -8, 0.5, -8)
+	iconTwo.SizeConstraint = Enum.SizeConstraint.RelativeXX
+	iconTwo.BorderSizePixel = 0
+	iconTwo.Size = UDim2.new(0, 16, 0, 16)
+	iconTwo.Parent = playStop
+
+	viewportFrame = Instance.new("ViewportFrame")
+	viewportFrame.Name = "ViewportFrame"
+	viewportFrame.Visible = false
+	viewportFrame.BorderMode = Enum.BorderMode.Inset
+	viewportFrame.LightColor = Color3.new(0.549, 0.525, 0.435)
+	viewportFrame.Ambient = Color3.new(0.318, 0.318, 0.318)
+	viewportFrame.Position = UDim2.new(0, 4, 0, 26)
+	viewportFrame.BackgroundColor3 = Library.MainColor
+	viewportFrame.BorderColor3 = Color3.new()
+	viewportFrame.Size = UDim2.new(1, -8, 0, 195)
+	viewportFrame.Parent = inner
+
+	worldModel = Instance.new("WorldModel", viewportFrame)
+
+	camera = Instance.new("Camera", viewportFrame)
+	camera.CameraType = Enum.CameraType.Scriptable
+	camera.FieldOfView = 70
+
+	speedText = Instance.new("TextLabel")
+	speedText.Name = "SpeedText"
+	speedText.FontFace = Font.new("rbxasset://fonts/families/RobotoMono.json")
+	speedText.TextColor3 = Library.FontColor
+	speedText.Text = "Speed (???)"
+	speedText.BackgroundTransparency = 1
+	speedText.BackgroundColor3 = Color3.new(1, 1, 1)
+	speedText.BorderSizePixel = 0
+	speedText.BorderColor3 = Color3.new()
+	speedText.TextSize = 12
+	speedText.Size = UDim2.new(0, 82, 0, 20)
+	speedText.ZIndex = 19
+	speedText.Parent = viewportFrame
+
+	noViewportFrame = Instance.new("Frame")
+	noViewportFrame.Name = "NoViewportFrame"
+	noViewportFrame.BackgroundColor3 = Library.MainColor
+	noViewportFrame.Position = UDim2.new(0, 4, 0, 26)
+	noViewportFrame.BorderColor3 = Color3.new()
+	noViewportFrame.BorderMode = Enum.BorderMode.Inset
+	noViewportFrame.Size = UDim2.new(1, -8, 0, 195)
+	noViewportFrame.Parent = inner
+
+	textLabel = Instance.new("TextLabel")
+	textLabel.Name = "TextLabel"
+	textLabel.FontFace = Font.new("rbxasset://fonts/families/RobotoMono.json")
+	textLabel.TextColor3 = Library.FontColor
+	textLabel.BorderColor3 = Color3.new()
+	textLabel.Text = "Unknown Error"
+	textLabel.BackgroundColor3 = Color3.new(1, 1, 1)
+	textLabel.BorderSizePixel = 0
+	textLabel.BackgroundTransparency = 1
+	textLabel.Position = UDim2.new(0.0968, 0, 0.369, 0)
+	textLabel.TextWrapped = true
+	textLabel.TextSize = 14
+	textLabel.Size = UDim2.new(0, 200, 0, 50)
+	textLabel.Parent = noViewportFrame
+
+	colorFrame = Instance.new("Frame")
+	colorFrame.Name = "Color"
+	colorFrame.BackgroundColor3 = Library.AccentColor
+	colorFrame.BorderColor3 = Color3.new()
+	colorFrame.BorderSizePixel = 0
+	colorFrame.Size = UDim2.new(1, 0, 0, 2)
+	colorFrame.Parent = inner
+
+	frameForwards = Instance.new("TextButton")
+	frameForwards.Name = "FrameForwards"
+	frameForwards.FontFace = Font.new("rbxasset://fonts/families/SourceSansPro.json")
+	frameForwards.TextColor3 = Color3.new()
+	frameForwards.Text = ""
+	frameForwards.Position = UDim2.new(0.323, 99, 0.835, -2)
+	frameForwards.BackgroundColor3 = Library.MainColor
+	frameForwards.BorderColor3 = Color3.new()
+	frameForwards.TextSize = 14
+	frameForwards.Size = UDim2.new(0, 69, 0, 20)
+	frameForwards.Parent = inner
+
+	iconThree = Instance.new("ImageLabel")
+	iconThree.Name = "Icon"
+	iconThree.ScaleType = Enum.ScaleType.Crop
+	iconThree.BorderColor3 = Color3.new()
+	iconThree.BackgroundColor3 = Library.FontColor
+	iconThree.Image = "rbxassetid://10734961809"
+	iconThree.BackgroundTransparency = 1
+	iconThree.Position = UDim2.new(0.5, -8, 0.5, -8)
+	iconThree.SizeConstraint = Enum.SizeConstraint.RelativeXX
+	iconThree.BorderSizePixel = 0
+	iconThree.Size = UDim2.new(0, 16, 0, 16)
+	iconThree.Parent = frameForwards
+
+	animationTextbox = Instance.new("TextBox")
+	animationTextbox.Name = "AnimationTextbox"
+	animationTextbox.CursorPosition = -1
+	animationTextbox.TextColor3 = Library.FontColor
+	animationTextbox.Text = "rbxassetid://0"
+	animationTextbox.BackgroundColor3 = Library.MainColor
+	animationTextbox.Position = UDim2.new(0.323, -78, 0.835, -24)
+	animationTextbox.BorderColor3 = Color3.new()
+	animationTextbox.FontFace = Font.new("rbxasset://fonts/families/RobotoMono.json")
+	animationTextbox.TextSize = 14
+	animationTextbox.Size = UDim2.new(0, 246, 0, 15)
+	animationTextbox.Parent = inner
+
+	-- Make draggable.
+	Library:MakeDraggable(outer)
+
+	-- Setup colors.
+	Library:AddToRegistry(colorFrame, {
+		BackgroundColor3 = "AccentColor",
+	}, true)
+
+	Library:AddToRegistry(animationVisualizerLabel, {
+		TextColor3 = "AccentColor",
+	}, true)
+
+	Library:AddToRegistry(hideBorderRight, {
+		BackgroundColor3 = "AccentColor",
+	}, true)
+
+	Library:AddToRegistry(sliderFill, {
+		BackgroundColor3 = "AccentColor",
+	}, true)
+
+	Library:AddToRegistry(inner, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "OutlineColor",
+	}, true)
+
+	Library:AddToRegistry(playStop, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "Black",
+	}, true)
+
+	Library:AddToRegistry(animationTextbox, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "Black",
+		TextColor3 = "FontColor",
+	}, true)
+
+	Library:AddToRegistry(icon, {
+		ImageColor3 = "FontColor",
+	}, true)
+
+	Library:AddToRegistry(iconTwo, {
+		ImageColor3 = "FontColor",
+	}, true)
+
+	Library:AddToRegistry(iconThree, {
+		ImageColor3 = "FontColor",
+	}, true)
+
+	Library:AddToRegistry(textLabel, {
+		TextColor3 = "FontColor",
+	}, true)
+
+	Library:AddToRegistry(speedText, {
+		TextColor3 = "FontColor",
+	}, true)
+
+	Library:AddToRegistry(noViewportFrame, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "Black",
+	}, true)
+
+	Library:AddToRegistry(frameBackwards, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "Black",
+	}, true)
+
+	Library:AddToRegistry(frameForwards, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "Black",
+	}, true)
+
+	Library:AddToRegistry(viewportFrame, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "Black",
+	}, true)
+
+	Library:AddToRegistry(sliderOuter, {
+		BorderColor3 = "Black",
+	}, true)
+
+	Library:AddToRegistry(sliderInner, {
+		BackgroundColor3 = "MainColor",
+		BorderColor3 = "Black",
+	}, true)
+
+	Library:AddToRegistry(sliderFill, {
+		BackgroundColor3 = "AccentColor",
+		BorderColor3 = "AccentColorDark",
+	}, true)
+
+	Library:AddToRegistry(sliderText, {
+		TextColor3 = "FontColor",
+	}, true)
+
+	-- Setup camera.
+	viewportFrame.CurrentCamera = camera
+
+	-- Setup intro scene.
+	AnimationVisualizer.message("Waiting For Animation ID")
+
+	-- Setup signals.
+	visualizerMaid:mark(sliderOuter.InputBegan:Connect(onSliderInputBegan))
+	visualizerMaid:mark(frameForwards.MouseButton1Click:Connect(onFrameForwards))
+	visualizerMaid:mark(frameBackwards.MouseButton1Click:Connect(onFrameBackwards))
+	visualizerMaid:mark(outer.InputBegan:Connect(outerFrameInputBegan))
+	visualizerMaid:mark(playStop.MouseButton1Click:Connect(togglePlayStop))
+	visualizerMaid:mark(runService.PreRender:Connect(onPlaybackLoop))
+	visualizerMaid:mark(animationTextbox.FocusLost:Connect(onIdFocusLost))
+end
+
+---Detach AnimationVisualizer module.
+function AnimationVisualizer.detach()
+	visualizerMaid:clean()
+
+	if visualizerScreenGui then
+		pcall(function()
+			visualizerScreenGui:Destroy()
+		end)
+
+		visualizerScreenGui = nil
+	end
 end
 
 --------------------------------------------------------------------------------
@@ -3102,7 +4238,7 @@ end
 
 ---Export samples to a file.
 function DifferenceCalculator.export()
-	local fs = logsFs()
+	local fs = FS_AVAILABLE and Filesystem.new(LOGS_FOLDER) or nil
 
 	if not fs then
 		return Logger.warn("Filesystem is unavailable; cannot export samples.")
@@ -3343,13 +4479,21 @@ function Defense.onAnimation(entity, track)
 		return
 	end
 
+	local distance = entityDistance(entity)
 	local timing = config:get().animation:index(normalizeAssetId(track.Animation.AnimationId))
 
 	if not timing then
+		InfoLogger.miss(
+			"Animation",
+			tostring(track.Animation.AnimationId),
+			track.Animation.Name,
+			distance,
+			entity and entity.Name or nil
+		)
 		return
 	end
 
-	local root = entity and entity:FindFirstChild("HumanoidRootPart")
+	local root = entity and entityRoot(entity)
 
 	if not root then
 		return
@@ -3362,13 +4506,15 @@ end
 ---@param entity Model
 ---@param inst Instance
 function Defense.onEffect(entity, inst)
+	local distance = entityDistance(entity)
 	local timing = config:get().effect:index(inst.Name)
 
 	if not timing then
+		InfoLogger.miss("Effect", inst.Name, nil, distance, entity and entity.Name or nil)
 		return
 	end
 
-	local root = entity and entity:FindFirstChild("HumanoidRootPart")
+	local root = entity and entityRoot(entity)
 
 	if not root then
 		return
@@ -3381,13 +4527,15 @@ end
 ---@param entity Model
 ---@param sound Sound
 function Defense.onSound(entity, sound)
+	local distance = entityDistance(entity)
 	local timing = config:get().sound:index(normalizeAssetId(sound.SoundId))
 
 	if not timing then
+		InfoLogger.miss("Sound", tostring(sound.SoundId), sound.Name, distance, entity and entity.Name or nil)
 		return
 	end
 
-	local root = entity and entity:FindFirstChild("HumanoidRootPart")
+	local root = entity and entityRoot(entity)
 
 	if not root then
 		return
@@ -3399,9 +4547,17 @@ end
 ---Handle a BasePart added to workspace (part timings).
 ---@param part BasePart
 function Defense.onPart(part)
+	local distance = nil
+	local localRoot = Input.localRoot()
+
+	if localRoot then
+		distance = (localRoot.Position - part.Position).Magnitude
+	end
+
 	local timing = config:get().part:index(part.Name)
 
 	if not timing then
+		InfoLogger.miss("Part", part.Name, nil, distance, part.Parent and part.Parent.Name or nil)
 		return
 	end
 
@@ -4725,11 +5881,12 @@ local function buildCombatTab(tab)
 	detectionBox:AddToggle("OnlyTargetPlayers", {
 		Text = "Only Target Players",
 		Default = false,
-	})
-
-	detectionBox:AddToggle("IgnoreCoreAnimations", {
-		Text = "Ignore Core Animations",
-		Default = true,
+		Callback = function(value)
+			if not value then
+				-- Re-hook NPCs without needing a script re-run.
+				Entities.rescan()
+			end
+		end,
 	})
 
 	detectionBox:AddToggle("VisualizeHitboxes", {
@@ -5059,53 +6216,72 @@ local function buildBuilderTab(tab)
 		end,
 	})
 
-	local logBox = tab:AddRightGroupbox("Animation Log")
+	local logBox = tab:AddRightGroupbox("Logger")
 
-	logBox:AddToggle("AnimationLogger", {
-		Text = "Animation Logger",
-		Default = true,
-	})
-
-	local animLogList = logBox:AddDropdown("AnimationLogList", {
-		Text = "Logged Animations",
-		Values = {},
-		AllowNull = true,
-	})
-
-	logBox:AddButton({
-		Text = "Refresh Log",
-		Func = function()
-			AnimationLog.refreshDropdown(animLogList)
+	local visualizerToggle = logBox:AddToggle("ShowAnimationVisualizer", {
+		Text = "Show Animation Visualizer",
+		Default = false,
+		Callback = function(value)
+			AnimationVisualizer.visible(value)
 		end,
 	})
 
-	logBox:AddButton({
-		Text = "Use Selected As Animation ID",
-		Func = function()
-			local value = Options.AnimationLogList and Options.AnimationLogList.Value
+	visualizerToggle:AddKeyPicker("AnimationVisualizerKeyBind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "Animation Visualizer",
+	})
 
-			if not value then
-				return Logger.warn("Select a logged animation first.")
-			end
-
-			local id = tostring(value):match("^(%S+)")
-
-			local section = BuilderSections.animation
-
-			if section and id then
-				section.loading = true
-				section.timingId:SetValue(id)
-				section.loading = false
-				Logger.notify("Set animation id to '%s'.", id)
-			end
+	local showLoggerToggle = logBox:AddToggle("ShowLoggerWindow", {
+		Text = "Show Logger Window",
+		Default = false,
+		Callback = function(value)
+			InfoLogger.visible(value)
 		end,
 	})
 
+	showLoggerToggle:AddKeyPicker("ShowLoggerWindowKeyBind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "Logger Window",
+	})
+
+	logBox:AddSlider("MinimumLoggerDistance", {
+		Text = "Minimum Logger Distance",
+		Min = 0,
+		Max = 100,
+		Rounding = 0,
+		Suffix = "m",
+		Default = 0,
+	})
+
+	logBox:AddSlider("MaximumLoggerDistance", {
+		Text = "Maximum Logger Distance",
+		Min = 0,
+		Max = 1000,
+		Rounding = 0,
+		Suffix = "m",
+		Default = 1000,
+	})
+
+	local blacklistedKeys = logBox:AddDropdown("BlacklistedKeys", {
+		Text = "Blacklisted Keys",
+		Values = InfoLogger.keyBlacklists(),
+		Multi = true,
+	})
+
 	logBox:AddButton({
-		Text = "Clear Log",
+		Text = "Remove Selected Keys",
 		Func = function()
-			AnimationLog.clear()
-			AnimationLog.refreshDropdown(animLogList)
+			for selected in next, blacklistedKeys.Value do
+				InfoLogger.Data.KeyBlacklistList[selected] = nil
+			end
+
+			GameData.data.blacklist = InfoLogger.Data.KeyBlacklistList
+			GameData.save()
+
+			blacklistedKeys:SetValues(InfoLogger.keyBlacklists())
+			blacklistedKeys:SetValue({})
 		end,
 	})
 
@@ -5162,7 +6338,6 @@ local function buildBuilderTab(tab)
 	return {
 		sections = sections,
 		loadedLabel = loadedLabel,
-		animLogList = animLogList,
 	}
 end
 
@@ -5202,17 +6377,15 @@ local function buildToolsTab(tab)
 	})
 
 	diffBox:AddButton({
-		Text = "Use Selected From Log",
+		Text = "Use Last Clicked Key",
 		Func = function()
-			local value = Options.AnimationLogList and Options.AnimationLogList.Value
+			local id = InfoLogger.lastClickedKey
 
-			if not value then
-				return Logger.warn("Select a logged animation in the Builder tab first.")
+			if not id then
+				return Logger.warn("Click an entry in the Info Logger first.")
 			end
 
-			local id = tostring(value):match("^(%S+)")
-
-			if id and Options.DiffAnimationId then
+			if Options.DiffAnimationId then
 				Options.DiffAnimationId:SetValue(id)
 			end
 		end,
@@ -5369,7 +6542,7 @@ local function onHeartbeat(dt)
 	end
 
 	TimingStore.heartbeat()
-	AnimationLog.flush()
+	Entities.trackPlayback()
 
 	if builderUI and builderUI.loadedLabel then
 		local text = string.format(
@@ -5399,11 +6572,10 @@ local function unload()
 		pcall(TimingStore.save, TimingStore.current)
 	end
 
-	AnimationLog.dirty = true
-	AnimationLog.lastFlush = 0
-	pcall(AnimationLog.flush)
 	pcall(GameData.save)
 
+	pcall(InfoLogger.detach)
+	pcall(AnimationVisualizer.detach)
 	pcall(Simulation.clear)
 	pcall(Hitbox.clean)
 	pcall(function()
@@ -5447,7 +6619,6 @@ local function init()
 	initialized = true
 
 	GameData.load()
-	AnimationLog.load()
 
 	Window = Library:CreateWindow({
 		Title = "UAPB",
@@ -5467,6 +6638,9 @@ local function init()
 	buildToolsTab(toolsTab)
 	buildSettingsTab(settingsTab)
 
+	InfoLogger.init()
+	AnimationVisualizer.init()
+
 	Library.ToggleKeybind = Options.MenuKeybind
 
 	updateRemoteLabels()
@@ -5476,6 +6650,7 @@ local function init()
 	Entities.start()
 
 	rootMaid:mark(runService.Heartbeat:Connect(onHeartbeat))
+	rootMaid:mark(runService.RenderStepped:Connect(InfoLogger.renderStepped))
 	rootMaid:mark(Simulation.maid)
 	rootMaid:mark(Entities.maid)
 	rootMaid:mark(DifferenceCalculator.maid)
