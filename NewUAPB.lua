@@ -2409,6 +2409,8 @@ local InfoLogger
 local DifferenceCalculator
 local Entities
 local AnimationVisualizer
+local AutoLearn
+local refreshAllSections
 
 --------------------------------------------------------------------------------
 -- Entities (universal entity discovery)
@@ -2527,6 +2529,10 @@ local function handleAnimationPlayed(entity, track)
 
 	if DifferenceCalculator then
 		DifferenceCalculator.onAnimation(entity, track)
+	end
+
+	if AutoLearn then
+		AutoLearn.onAnimation(entity, track)
 	end
 
 	if Defense then
@@ -4107,6 +4113,321 @@ function DifferenceCalculator.export()
 	else
 		Logger.warn("Failed to export samples: %s", err)
 	end
+end
+
+--------------------------------------------------------------------------------
+-- AutoLearn
+--------------------------------------------------------------------------------
+
+---@class AutoLearn
+AutoLearn = {
+	maid = Maid.new(),
+	pending = {}, -- [track] = {entity, track, id, animName, startedAt, pressAt?, delayMs?, distance?, conn?}
+	samples = {}, -- [id] = { delays = {}, distances = {} }
+	ui = { statusLabel = nil, listLabel = nil },
+}
+
+---Watched animation ids (persisted per game).
+---@return string[]
+function AutoLearn.ids()
+	GameData.data.autoLearnIds = GameData.data.autoLearnIds or {}
+	return GameData.data.autoLearnIds
+end
+
+---Write the watch list and persist.
+---@param list string[]
+function AutoLearn.setIds(list)
+	GameData.data.autoLearnIds = list
+	GameData.save()
+	AutoLearn.updateListLabel()
+end
+
+---@param list string[]
+---@return boolean
+local function idInList(list, id)
+	for _, watched in next, list do
+		if watched == id then
+			return true
+		end
+	end
+
+	return false
+end
+
+---Update the "Watching: N IDs" label.
+function AutoLearn.updateListLabel()
+	if AutoLearn.ui.listLabel then
+		AutoLearn.ui.listLabel:SetText(string.format("Watching: %d IDs", #AutoLearn.ids()))
+	end
+end
+
+---Update the status label.
+---@param fmt string
+function AutoLearn.status(fmt, ...)
+	if AutoLearn.ui.statusLabel then
+		AutoLearn.ui.statusLabel:SetText("Status: " .. format(fmt, ...))
+	end
+end
+
+---@param p table
+local function dropPending(p)
+	if p.conn then
+		pcall(function()
+			p.conn:Disconnect()
+		end)
+
+		p.conn = nil
+	end
+
+	AutoLearn.pending[p.track] = nil
+end
+
+---Option getter with fallback.
+---@param name string
+---@param fallback number
+---@return number
+local function learnOption(name, fallback)
+	return (Options and Options[name] and Options[name].Value) or fallback
+end
+
+---Called when a watched animation track stops.
+---@param track AnimationTrack
+function AutoLearn.onStopped(track)
+	local p = AutoLearn.pending[track]
+
+	if not p then
+		return
+	end
+
+	dropPending(p)
+
+	if not p.pressAt then
+		AutoLearn.status("'%s' ended without a press", p.animName)
+		return
+	end
+
+	if os.clock() - p.pressAt > learnOption("AutoLearnCancelWindow", 400) / 1000 then
+		AutoLearn.status("'%s' ended too late after press (not a parry)", p.animName)
+		return
+	end
+
+	-- Early-end check: a parried animation stops before its natural end.
+	local early = true
+
+	pcall(function()
+		early = track.Looped or track.Length <= 0 or (track.TimePosition < track.Length - 0.05)
+	end)
+
+	if not early then
+		AutoLearn.status("'%s' played fully (not a parry)", p.animName)
+		return
+	end
+
+	AutoLearn.commit(p)
+end
+
+---Commit a learned sample into a timing.
+---@param p table
+function AutoLearn.commit(p)
+	local samples = AutoLearn.samples[p.id]
+
+	if not samples then
+		samples = { delays = {}, distances = {} }
+		AutoLearn.samples[p.id] = samples
+	end
+
+	table.insert(samples.delays, p.delayMs)
+
+	if p.distance then
+		table.insert(samples.distances, p.distance)
+	end
+
+	local sum, count = 0, 0
+
+	for _, delay in next, samples.delays do
+		sum = sum + delay
+		count = count + 1
+	end
+
+	local avgDelay = math.floor(sum / math.max(count, 1) + 0.5)
+	local maxDist = 0
+
+	for _, distance in next, samples.distances do
+		maxDist = math.max(maxDist, distance)
+	end
+
+	local size = maxDist + learnOption("AutoLearnPadding", 1)
+	local container = config:get().animation
+	local timing = container:index(p.id)
+	local updateExisting = Toggles and Toggles.AutoLearnUpdateExisting and Toggles.AutoLearnUpdateExisting.Value
+
+	if not timing then
+		local name = p.animName ~= "" and p.animName or p.id
+
+		if container:find(name) then
+			name = string.format("%s (%s)", name, p.id)
+		end
+
+		timing = AnimationTiming.new({ _id = p.id })
+		timing.name = name
+		timing.fhb = true
+		timing.hitbox = Vector3.new(size, size, size)
+
+		local ok, err = timing.actions:push(Action.new({
+			_type = "Parry",
+			name = "Parry",
+			_when = avgDelay,
+		}))
+
+		if not ok then
+			AutoLearn.status("failed: %s", err)
+			return Logger.warn("Auto Learn action push failed: %s", err)
+		end
+
+		local pushed, pushErr = container:push(timing)
+
+		if not pushed then
+			AutoLearn.status("failed: %s", pushErr)
+			return Logger.warn("Auto Learn timing push failed: %s", pushErr)
+		end
+	elseif updateExisting then
+		timing.hitbox = Vector3.new(size, size, size)
+		timing.fhb = true
+
+		local target = nil
+
+		for _, action in next, timing.actions:sorted() do
+			if action._type == "Parry" then
+				target = action
+				break
+			end
+		end
+
+		target = target or timing.actions:sorted()[1]
+
+		if target then
+			target._when = avgDelay
+		end
+	else
+		AutoLearn.status("'%s' recorded sample only (update disabled)", p.animName)
+	end
+
+	TimingStore.markDirty()
+
+	if refreshAllSections then
+		refreshAllSections()
+	end
+
+	Logger.notify("Auto Learn: %s -> delay %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
+	AutoLearn.status("'%s' -> %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
+end
+
+---Handle an entity animation for auto learning.
+---@param entity Model
+---@param track AnimationTrack
+function AutoLearn.onAnimation(entity, track)
+	if not (Toggles and Toggles.AutoLearnEnabled and Toggles.AutoLearnEnabled.Value) then
+		return
+	end
+
+	if not track or not track.Animation then
+		return
+	end
+
+	if entity == (localPlayer and localPlayer.Character) then
+		return
+	end
+
+	local id = normalizeAssetId(track.Animation.AnimationId)
+
+	if not idInList(AutoLearn.ids(), id) then
+		return
+	end
+
+	local p = {
+		entity = entity,
+		track = track,
+		id = id,
+		animName = track.Animation.Name,
+		startedAt = os.clock(),
+	}
+
+	p.conn = track.Stopped:Connect(function()
+		AutoLearn.onStopped(track)
+	end)
+
+	AutoLearn.pending[track] = p
+
+	local pressWindow = learnOption("AutoLearnPressWindow", 1500)
+	local cancelWindow = learnOption("AutoLearnCancelWindow", 400)
+	local length = 0
+
+	pcall(function()
+		length = track.Length
+	end)
+
+	task.delay((pressWindow + cancelWindow) / 1000 + math.max(length, 0) + 1, function()
+		if AutoLearn.pending[track] == p then
+			dropPending(p)
+			AutoLearn.status("'%s' watch timed out", p.animName)
+		end
+	end)
+end
+
+---Start listening for manual parry presses.
+function AutoLearn.start()
+	AutoLearn.maid:mark(userInputService.InputBegan:Connect(function(input)
+		if UNLOADED then
+			return
+		end
+
+		if not (Toggles and Toggles.AutoLearnEnabled and Toggles.AutoLearnEnabled.Value) then
+			return
+		end
+
+		local keyName = (Options and Options.ParryKey and Options.ParryKey.Value) or "F"
+		local matched = false
+
+		if keyName == "MB1" then
+			matched = input.UserInputType == Enum.UserInputType.MouseButton1
+		elseif keyName == "MB2" then
+			matched = input.UserInputType == Enum.UserInputType.MouseButton2
+		else
+			matched = input.KeyCode and input.KeyCode.Name == keyName
+		end
+
+		if not matched then
+			return
+		end
+
+		local now = os.clock()
+		local pressWindow = learnOption("AutoLearnPressWindow", 1500)
+
+		for _, p in next, AutoLearn.pending do
+			if p.pressAt or now - p.startedAt > pressWindow / 1000 then
+				continue
+			end
+
+			local distance = entityDistance(p.entity)
+
+			if distance == nil then
+				continue
+			end
+
+			p.pressAt = now
+			p.delayMs = math.floor((now - p.startedAt) * 1000 + 0.5)
+			p.distance = distance
+		end
+	end))
+end
+
+---Stop auto learning.
+function AutoLearn.stop()
+	for _, p in next, AutoLearn.pending do
+		dropPending(p)
+	end
+
+	AutoLearn.maid:clean()
 end
 
 --------------------------------------------------------------------------------
@@ -5777,8 +6098,6 @@ local function buildCombatTab(tab)
 	})
 end
 
-local refreshAllSections
-
 ---Build the Builder tab.
 ---@param tab table
 ---@return table labels for periodic updates
@@ -6161,6 +6480,105 @@ local function buildToolsTab(tab)
 		end,
 	})
 
+	local learnBox = tab:AddLeftGroupbox("Auto Learn Timings")
+
+	learnBox:AddToggle("AutoLearnEnabled", {
+		Text = "Enable Auto Learn",
+		Default = false,
+	})
+
+	learnBox:AddInput("AutoLearnIds", {
+		Text = "Animation IDs (comma/space separated)",
+		Default = table.concat(AutoLearn.ids(), ", "),
+		Callback = function(value)
+			local list = {}
+
+			for token in tostring(value):gmatch("[^,%s]+") do
+				local id = normalizeAssetId(token)
+
+				if #id > 0 then
+					table.insert(list, id)
+				end
+			end
+
+			AutoLearn.setIds(list)
+		end,
+	})
+
+	learnBox:AddButton({
+		Text = "Add Last Clicked Logger Key",
+		Func = function()
+			local key = InfoLogger.lastClickedKey
+
+			if not key then
+				return Logger.warn("Click an entry in the Info Logger first.")
+			end
+
+			local ids = AutoLearn.ids()
+			local id = normalizeAssetId(key)
+
+			for _, existing in next, ids do
+				if existing == id then
+					return
+				end
+			end
+
+			table.insert(ids, id)
+
+			if Options.AutoLearnIds then
+				Options.AutoLearnIds:SetValue(table.concat(ids, ", "))
+			else
+				AutoLearn.setIds(ids)
+			end
+		end,
+	})
+
+	learnBox:AddButton({
+		Text = "Clear IDs",
+		Func = function()
+			if Options.AutoLearnIds then
+				Options.AutoLearnIds:SetValue("")
+			else
+				AutoLearn.setIds({})
+			end
+		end,
+	})
+
+	AutoLearn.ui.listLabel = learnBox:AddLabel(string.format("Watching: %d IDs", #AutoLearn.ids()))
+
+	learnBox:AddSlider("AutoLearnPressWindow", {
+		Text = "Press Window (ms)",
+		Min = 100,
+		Max = 3000,
+		Default = 1500,
+		Rounding = 0,
+	})
+
+	learnBox:AddSlider("AutoLearnCancelWindow", {
+		Text = "Cancel Window (ms)",
+		Min = 50,
+		Max = 1500,
+		Default = 400,
+		Rounding = 0,
+	})
+
+	learnBox:AddSlider("AutoLearnPadding", {
+		Text = "Hitbox Padding (studs)",
+		Min = 0,
+		Max = 10,
+		Default = 1,
+		Rounding = 1,
+	})
+
+	learnBox:AddToggle("AutoLearnUpdateExisting", {
+		Text = "Update Existing Timings",
+		Default = true,
+	})
+
+	AutoLearn.ui.statusLabel = learnBox:AddLabel("Status: idle")
+
+	learnBox:AddLabel("Tip: disable Auto Parry while learning.")
+
 	local infoBox = tab:AddRightGroupbox("Info")
 
 	infoBox:AddLabel("PlaceId: " .. tostring(placeId))
@@ -6236,6 +6654,8 @@ local function onHeartbeat(dt)
 		fpsCounter = math.floor(1 / dt + 0.5)
 	end
 
+	Simulation.step()
+
 	heartbeatAccumulator = heartbeatAccumulator + (dt or 0)
 
 	if heartbeatAccumulator < 0.5 then
@@ -6293,6 +6713,7 @@ local function unload()
 	pcall(function()
 		DifferenceCalculator.maid:clean()
 	end)
+	pcall(AutoLearn.stop)
 	pcall(function()
 		for _, state in next, Entities.tracked do
 			state.maid:clean()
@@ -6356,6 +6777,7 @@ local function init()
 	refreshRemoteDropdowns()
 
 	DifferenceCalculator.start()
+	AutoLearn.start()
 	Entities.start()
 
 	rootMaid:mark(runService.Heartbeat:Connect(onHeartbeat))
@@ -6363,6 +6785,7 @@ local function init()
 	rootMaid:mark(Simulation.maid)
 	rootMaid:mark(Entities.maid)
 	rootMaid:mark(DifferenceCalculator.maid)
+	rootMaid:mark(AutoLearn.maid)
 
 	Library:OnUnload(unload)
 
