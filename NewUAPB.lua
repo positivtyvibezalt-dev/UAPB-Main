@@ -10,7 +10,7 @@
 	Storage layout (inside the executor workspace folder):
 		UAPB/Timings/<name>.json            saved timing files
 		UAPB/Configs/settings/*.json        Linoria SaveManager UI configs
-		UAPB/Games/<PlaceId>.json           per-game data (captured remotes, blacklist, autoload timing name)
+		UAPB/Games/<PlaceId>.json           per-game data (remote templates, blacklist, autoload timing name)
 		UAPB/Logs/difference_<PlaceId>_<time>.json exported difference samples
 ]]
 
@@ -58,10 +58,6 @@ local function env(name)
 	return rawget(_G, name)
 end
 
-local newcclosure = env("newcclosure")
-local hookmetamethod = env("hookmetamethod")
-local getnamecallmethod = env("getnamecallmethod")
-local checkcaller = env("checkcaller")
 local getgc = env("getgc")
 local getrawmetatable = env("getrawmetatable")
 local identifyexecutor = env("identifyexecutor")
@@ -1790,7 +1786,7 @@ function TimingStore.heartbeat()
 end
 
 --------------------------------------------------------------------------------
--- RemoteResolver + RemoteCapture
+-- RemoteResolver
 --------------------------------------------------------------------------------
 
 ---@class RemoteTemplate
@@ -1964,7 +1960,7 @@ local function resolveInstancePath(path)
 	return walkPath(path)
 end
 
----Substitute special markers in captured/user-typed args.
+---Substitute special markers in user-typed template args.
 ---@param args table
 ---@return table
 function RemoteResolver.substituteArgs(args)
@@ -2046,158 +2042,10 @@ function RemoteResolver.fire(template)
 	return ok, err
 end
 
----@class RemoteCapture
-local RemoteCapture = {
-	capturing = nil,
-	captureDeadline = 0,
-	buffer = {},
-	installed = false,
-	hookOriginal = nil,
-}
-
----Convert a value into a JSON-serializable form.
----@param value any
----@return any
-local function serializeArg(value)
-	local valueType = typeof(value)
-
-	if valueType == "Instance" then
-		return "$INSTANCE:" .. value:GetFullName()
-	elseif valueType == "CFrame" then
-		return { __type = "CFrame", components = { value:GetComponents() } }
-	elseif valueType == "Vector3" then
-		return { __type = "Vector3", components = { value.X, value.Y, value.Z } }
-	elseif valueType == "Vector2" then
-		return { __type = "Vector2", components = { value.X, value.Y } }
-	elseif valueType == "number" or valueType == "string" or valueType == "boolean" or valueType == "nil" then
-		return value
-	elseif valueType == "table" then
-		local out = {}
-		local convertible = true
-
-		for key, item in next, value do
-			if typeof(key) ~= "string" and typeof(key) ~= "number" then
-				convertible = false
-				break
-			end
-
-			local serialized = serializeArg(item)
-
-			if serialized == nil then
-				convertible = false
-				break
-			end
-
-			out[key] = serialized
-		end
-
-		if convertible then
-			return out
-		end
-
-		return tostring(value)
-	end
-
-	return tostring(value)
-end
-
----@param list table
----@return table
-local function serializeArgs(...)
-	local out = {}
-
-	for idx = 1, select("#", ...) do
-		out[idx] = serializeArg(select(idx, ...))
-	end
-
-	return out
-end
-
----Check whether a remote name is ignored by the capture filter.
----@param name string
----@return boolean
-local function captureIgnored(name)
-	local filter = (Options and Options.CaptureIgnore and Options.CaptureIgnore.Value)
-		or "Ping,Heartbeat,Replicate,Position,Camera"
-
-	for word in string.gmatch(filter, "[^,]+") do
-		word = word:gsub("^%s+", ""):gsub("%s+$", "")
-
-		if #word > 0 and name:lower():find(word:lower(), 1, true) then
-			return true
-		end
-	end
-
-	return false
-end
-
----Install the universal __namecall hook (lazy, first capture only).
-function RemoteCapture.install()
-	if RemoteCapture.installed then
-		return
-	end
-
-	if not (hookmetamethod and getnamecallmethod and checkcaller) then
-		return
-	end
-
-	RemoteCapture.installed = true
-
-	local hookFn
-	hookFn = function(self, ...)
-		local method = getnamecallmethod()
-
-		if
-			not UNLOADED
-			and not checkcaller()
-			and (method == "FireServer" or method == "InvokeServer")
-			and RemoteCapture.capturing
-			and os.clock() <= RemoteCapture.captureDeadline
-			and typeof(self) == "Instance"
-			and isRemote(self)
-			and not captureIgnored(self.Name)
-		then
-			if #RemoteCapture.buffer < 20 then
-				table.insert(RemoteCapture.buffer, {
-					path = self:GetFullName(),
-					method = method,
-					args = serializeArgs(...),
-				})
-			end
-		end
-
-		return RemoteCapture.hookOriginal(self, ...)
-	end
-
-	RemoteCapture.hookOriginal = hookmetamethod(game, "__namecall", newcclosure and newcclosure(hookFn) or hookFn)
-end
-
----Begin capturing remotes of a kind ("Parry" or "Dodge").
----@param kind string
-function RemoteCapture.start(kind)
-	if not (hookmetamethod and getnamecallmethod and checkcaller) then
-		return Logger.notify("Executor lacks hookmetamethod; remote capture unavailable.")
-	end
-
-	RemoteCapture.install()
-
-	RemoteCapture.capturing = kind
-	RemoteCapture.buffer = {}
-	RemoteCapture.captureDeadline = os.clock()
-		+ ((Options and Options.CaptureWindow and Options.CaptureWindow.Value) or 5)
-
-	Logger.notify("Capturing remotes for '%s' — perform the action now.", kind)
-end
-
----Stop capturing.
-function RemoteCapture.stop()
-	RemoteCapture.capturing = nil
-end
-
 ---Persist a remote template into per-game data.
 ---@param name string
 ---@param template RemoteTemplate
-function RemoteCapture.saveTemplate(name, template)
+local function saveRemoteTemplate(name, template)
 	GameDataRemotes()[name] = {
 		path = template.path,
 		method = template.method,
@@ -5685,7 +5533,6 @@ end
 local RemoteUI = {
 	parryLabel = nil,
 	dodgeLabel = nil,
-	captured = nil,
 }
 
 ---Update the remote status labels.
@@ -5699,70 +5546,6 @@ local function updateRemoteLabels()
 		local template = GameDataRemotes()["Dodge"]
 		RemoteUI.dodgeLabel:SetText("Dodge remote: " .. (template and template.path or "none"))
 	end
-end
-
----@param entry table
----@return string
-local function captureEntryLabel(idx, entry)
-	local preview = ""
-
-	local ok, encoded = pcall(httpService.JSONEncode, httpService, entry.args)
-
-	if ok and type(encoded) == "string" then
-		preview = encoded
-
-		if #preview > 60 then
-			preview = preview:sub(1, 60) .. "..."
-		end
-	end
-
-	return string.format("%d. %s (%s) %s", idx, entry.path, entry.method, preview)
-end
-
----Refresh the captured-remotes dropdown.
-local function refreshCaptured()
-	if not RemoteUI.captured then
-		return
-	end
-
-	local values = {}
-
-	for idx, entry in next, RemoteCapture.buffer do
-		table.insert(values, captureEntryLabel(idx, entry))
-	end
-
-	RemoteUI.captured:SetValues(values)
-end
-
----Parse the selected capture entry index.
----@return table?
-local function selectedCapture()
-	local value = RemoteUI.captured and RemoteUI.captured.Value
-
-	if not value then
-		return nil
-	end
-
-	local idx = tonumber(tostring(value):match("^(%d+)%."))
-
-	if not idx then
-		return nil
-	end
-
-	return RemoteCapture.buffer[tonumber(idx)]
-end
-
----@param kind string
-local function assignCaptured(kind)
-	local entry = selectedCapture()
-
-	if not entry then
-		return Logger.warn("No captured remote selected.")
-	end
-
-	RemoteCapture.saveTemplate(kind, entry)
-	updateRemoteLabels()
-	Logger.notify("Set %s remote to '%s'.", kind, entry.path)
 end
 
 ---Parse the manual-args Lua table literal.
@@ -5794,7 +5577,7 @@ local function assignManual(kind)
 		return Logger.warn("Enter a remote path first.")
 	end
 
-	RemoteCapture.saveTemplate(kind, {
+	saveRemoteTemplate(kind, {
 		path = path,
 		method = (Options.RC_ManualMethod and Options.RC_ManualMethod.Value) or "FireServer",
 		args = parseManualArgs(),
@@ -5918,82 +5701,6 @@ local function buildCombatTab(tab)
 
 	RemoteUI.parryLabel = remoteBox:AddLabel("Parry remote: none")
 	RemoteUI.dodgeLabel = remoteBox:AddLabel("Dodge remote: none")
-
-	remoteBox:AddSlider("CaptureWindow", {
-		Text = "Capture Window (s)",
-		Min = 1,
-		Max = 30,
-		Default = 5,
-		Rounding = 0,
-	})
-
-	remoteBox:AddInput("CaptureIgnore", {
-		Text = "Capture Ignore Filter",
-		Default = "Ping,Heartbeat,Replicate,Position,Camera",
-	})
-
-	remoteBox:AddButton({
-		Text = "Capture (Parry)",
-		Func = function()
-			RemoteCapture.start("Parry")
-		end,
-	})
-
-	remoteBox:AddButton({
-		Text = "Capture (Dodge)",
-		Func = function()
-			RemoteCapture.start("Dodge")
-		end,
-	})
-
-	RemoteUI.captured = remoteBox:AddDropdown("RC_Captured", {
-		Text = "Captured Remotes",
-		Values = {},
-		AllowNull = true,
-	})
-
-	remoteBox:AddButton({
-		Text = "Refresh Captured List",
-		Func = refreshCaptured,
-	})
-
-	remoteBox:AddButton({
-		Text = "Use Selected For Parry",
-		Func = function()
-			assignCaptured("Parry")
-		end,
-	})
-
-	remoteBox:AddButton({
-		Text = "Use Selected For Dodge",
-		Func = function()
-			assignCaptured("Dodge")
-		end,
-	})
-
-	remoteBox:AddInput("RC_TemplateName", {
-		Text = "Template Name",
-	})
-
-	remoteBox:AddButton({
-		Text = "Save Selected As Named Template",
-		Func = function()
-			local entry = selectedCapture()
-			local name = Options.RC_TemplateName and Options.RC_TemplateName.Value
-
-			if not entry then
-				return Logger.warn("No captured remote selected.")
-			end
-
-			if not name or #name == 0 then
-				return Logger.warn("Enter a template name first.")
-			end
-
-			RemoteCapture.saveTemplate(name, entry)
-			refreshRemoteDropdowns()
-			Logger.notify("Saved remote template '%s' -> '%s'.", name, entry.path)
-		end,
-	})
 
 	remoteBox:AddButton({
 		Text = "Clear Parry Remote",
@@ -6272,6 +5979,7 @@ local function buildBuilderTab(tab)
 		Text = "Blacklisted Keys",
 		Values = InfoLogger.keyBlacklists(),
 		Multi = true,
+		AllowNull = true,
 	})
 
 	logBox:AddButton({
@@ -6459,9 +6167,6 @@ local function buildToolsTab(tab)
 	infoBox:AddLabel("Executor: " .. ((identifyexecutor and identifyexecutor()) or "Unknown"))
 	infoBox:AddLabel("Storage root: " .. ROOT_FOLDER)
 	infoBox:AddLabel("Filesystem available: " .. tostring(FS_AVAILABLE and true or false))
-	infoBox:AddLabel(
-		"Hook available: " .. tostring(hookmetamethod and getnamecallmethod and checkcaller and true or false)
-	)
 end
 
 ---Build the Settings tab.
