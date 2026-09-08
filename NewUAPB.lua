@@ -2917,7 +2917,7 @@ function Entities.trackPlayback()
 
 			if not track.IsPlaying then
 				state.pbdata[track] = nil
-				state.rpbdata[tostring(track.Animation and track.Animation.AnimationId or "")] = data
+				state.rpbdata[normalizeAssetId(track.Animation and track.Animation.AnimationId or "")] = data
 				continue
 			end
 
@@ -3119,7 +3119,11 @@ function InfoLogger.addMissEntry(entryType, key, name, distance, parent)
 			table.remove(mde, last[2])
 		end
 
-		local asset = typeof(key) == "string" and tonumber(normalizeAssetId(key):match("%d+")) or nil
+		local asset = nil
+
+		if (entryType == "Animation" or entryType == "Sound") and typeof(key) == "string" then
+			asset = tonumber(normalizeAssetId(key):match("%d+") or "")
+		end
 
 		-- Create a new label.
 		local label = Library:CreateLabel({
