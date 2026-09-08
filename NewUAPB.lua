@@ -19,38 +19,46 @@
 -- Services + executor shims
 --------------------------------------------------------------------------------
 
+-- Roblox engine builtins (game, workspace, Instance, Vector3, Vector2, CFrame, Color3, Enum,
+-- task, warn, typeof, bit32, OverlapParams, loadstring, unpack) are used as plain globals.
+local loadstringFn = loadstring
+local unpackFn = unpack or table.unpack
+
+-- Executor-provided environment accessors, read as plain globals.
+local getgenvFn = getgenv
+local getfenvFn = getfenv
+
+---Resolve an executor-provided function: getgenv() first, then getfenv(0), then _G.
+---@param name string
+---@return any
 local function env(name)
-	local value = rawget(_G, name)
+	if getgenvFn then
+		local ok, envTable = pcall(getgenvFn)
 
-	if value == nil then
-		local getfenvFn = rawget(_G, "getfenv")
+		if ok and type(envTable) == "table" then
+			local value = rawget(envTable, name)
 
-		if getfenvFn then
-			local ok, fenv = pcall(getfenvFn, 0)
-
-			if ok and type(fenv) == "table" then
-				value = rawget(fenv, name)
+			if value ~= nil then
+				return value
 			end
 		end
 	end
 
-	return value
+	if getfenvFn then
+		local ok, fenv = pcall(getfenvFn, 0)
+
+		if ok and type(fenv) == "table" then
+			local value = rawget(fenv, name)
+
+			if value ~= nil then
+				return value
+			end
+		end
+	end
+
+	return rawget(_G, name)
 end
 
-local game = env("game")
-local workspace = env("workspace")
-local typeof = env("typeof") or type
-local loadstringFn = env("loadstring") or env("load")
-local unpackFn = env("unpack") or table.unpack
-local Instance = env("Instance")
-local Vector3 = env("Vector3")
-local Vector2 = env("Vector2")
-local CFrame = env("CFrame")
-local Color3 = env("Color3")
-local Enum = env("Enum")
-local task = env("task")
-local warn = env("warn") or print
-local OverlapParams = env("OverlapParams")
 local newcclosure = env("newcclosure")
 local hookmetamethod = env("hookmetamethod")
 local getnamecallmethod = env("getnamecallmethod")
@@ -58,13 +66,12 @@ local checkcaller = env("checkcaller")
 local getgc = env("getgc")
 local getrawmetatable = env("getrawmetatable")
 local identifyexecutor = env("identifyexecutor")
-local bit32 = env("bit32")
 
 -- Linoria UI tables, assigned after the library loads.
 local Toggles
 local Options
 
-local getgenvSafe = env("getgenv") or function()
+local getgenvSafe = getgenvFn or function()
 	return _G
 end
 
