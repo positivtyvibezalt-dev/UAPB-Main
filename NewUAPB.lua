@@ -2091,6 +2091,42 @@ function RemoteResolver.substituteArgs(args)
 				resolved = mouse and mouse.Hit or CFrame.new()
 			elseif value == "$CAMERA_CF" then
 				resolved = camera and camera.CFrame or CFrame.new()
+			elseif value == "$AIM_POS" then
+				resolved = Vector3.zero
+				pcall(function()
+					if not camera then
+						return
+					end
+
+					local origin = camera.CFrame.Position
+					local direction = camera.CFrame.LookVector * 1000
+					local params = RaycastParams.new()
+					params.FilterType = Enum.RaycastFilterType.Exclude
+					params.FilterDescendantsInstances = character and { character } or {}
+
+					local hit = workspace:Raycast(origin, direction, params)
+
+					resolved = (hit and hit.Position) or (origin + direction)
+				end)
+			elseif value:sub(1, 6) == "$ENUM:" then
+				resolved = nil
+
+				local enumText = value:sub(7)
+				local familyName, itemName = enumText:match("^([^%.]+)%.(.+)$")
+
+				if familyName and itemName then
+					local ok, enumValue = pcall(function()
+						return Enum[familyName][itemName]
+					end)
+
+					if ok and enumValue ~= nil then
+						resolved = enumValue
+					else
+						Logger.warn("Could not resolve enum marker '%s'.", value)
+					end
+				else
+					Logger.warn("Malformed enum marker '%s' (expected $ENUM:Family.Item).", value)
+				end
 			elseif value:sub(1, 10) == "$INSTANCE:" then
 				resolved = resolveInstancePath(value:sub(11))
 			end
@@ -2134,6 +2170,21 @@ function RemoteResolver.fire(template)
 	end
 
 	local args = RemoteResolver.substituteArgs(template.args or {})
+
+	if method == "InvokeServer" then
+		-- InvokeServer yields for a response; spawn it so the defense thread isn't blocked.
+		task.spawn(function()
+			local ok, err = pcall(remote[method], remote, unpackFn(args))
+
+			if not ok then
+				RemoteResolver.cache[template.path or template.name] = nil
+				Logger.warn("Remote '%s' failed: %s", template.path or template.name, err)
+			end
+		end)
+
+		return true
+	end
+
 	local ok, err = pcall(remote[method], remote, unpackFn(args))
 
 	if not ok then
@@ -2143,6 +2194,30 @@ function RemoteResolver.fire(template)
 
 	return ok, err
 end
+
+---Built-in remote templates for known games.
+local RemotePresets = {
+	ABS = {
+		Parry = {
+			path = 'game:GetService("Players").LocalPlayer.Remotes.RequestAction',
+			method = "InvokeServer",
+			args = {
+				"Parry",
+				"$ENUM:UserInputState.End",
+				{ MouseLock = false, MousePosition = "$AIM_POS" },
+			},
+		},
+		Dodge = {
+			path = 'game:GetService("Players").LocalPlayer.Remotes.RequestAction',
+			method = "InvokeServer",
+			args = {
+				"Roll",
+				"$ENUM:UserInputState.Begin",
+				{ MouseLock = false, MousePosition = "$AIM_POS" },
+			},
+		},
+	},
+}
 
 ---Persist a remote template into per-game data.
 ---@param name string
@@ -2155,6 +2230,9 @@ local function saveRemoteTemplate(name, template)
 		name = name,
 	}
 
+	-- Saving a template re-enables that kind.
+	GameDataRemotesDisabled()[name] = nil
+
 	GameData.save()
 end
 
@@ -2162,6 +2240,13 @@ end
 function GameDataRemotes()
 	GameData.data.remotes = GameData.data.remotes or {}
 	return GameData.data.remotes
+end
+
+---Per-game map of remote kinds the user disabled without deleting.
+---@return table
+function GameDataRemotesDisabled()
+	GameData.data.remotesDisabled = GameData.data.remotesDisabled or {}
+	return GameData.data.remotesDisabled
 end
 
 --------------------------------------------------------------------------------
@@ -2247,6 +2332,10 @@ local function fireDefenseRemote(kind)
 	end
 
 	local template = GameDataRemotes()[kind]
+
+	if GameDataRemotesDisabled()[kind] then
+		template = nil
+	end
 
 	if template then
 		RemoteResolver.fire(template)
@@ -4638,6 +4727,10 @@ function Defense.execute(action, timing, entity)
 	elseif actionType == "Remote" then
 		local template = action.remote and GameDataRemotes()[action.remote]
 
+		if action.remote and GameDataRemotesDisabled()[action.remote] then
+			template = nil
+		end
+
 		if template then
 			RemoteResolver.fire(template)
 		else
@@ -6010,12 +6103,24 @@ local RemoteUI = {
 local function updateRemoteLabels()
 	if RemoteUI.parryLabel then
 		local template = GameDataRemotes()["Parry"]
-		RemoteUI.parryLabel:SetText("Parry remote: " .. (template and template.path or "none"))
+		local text = "Parry remote: " .. (template and template.path or "none")
+
+		if template and GameDataRemotesDisabled()["Parry"] then
+			text = text .. " (disabled)"
+		end
+
+		RemoteUI.parryLabel:SetText(text)
 	end
 
 	if RemoteUI.dodgeLabel then
 		local template = GameDataRemotes()["Dodge"]
-		RemoteUI.dodgeLabel:SetText("Dodge remote: " .. (template and template.path or "none"))
+		local text = "Dodge remote: " .. (template and template.path or "none")
+
+		if template and GameDataRemotesDisabled()["Dodge"] then
+			text = text .. " (disabled)"
+		end
+
+		RemoteUI.dodgeLabel:SetText(text)
 	end
 end
 
@@ -6173,21 +6278,67 @@ local function buildCombatTab(tab)
 	RemoteUI.parryLabel = remoteBox:AddLabel("Parry remote: none")
 	RemoteUI.dodgeLabel = remoteBox:AddLabel("Dodge remote: none")
 
+	remoteBox
+		:AddButton({
+			Text = "Stop Using Parry Remote",
+			Func = function()
+				GameDataRemotesDisabled()["Parry"] = true
+				GameData.save()
+				updateRemoteLabels()
+			end,
+		})
+		:AddButton({
+			Text = "Use Parry Remote",
+			Func = function()
+				GameDataRemotesDisabled()["Parry"] = nil
+				GameData.save()
+				updateRemoteLabels()
+			end,
+		})
+
+	remoteBox
+		:AddButton({
+			Text = "Stop Using Dodge Remote",
+			Func = function()
+				GameDataRemotesDisabled()["Dodge"] = true
+				GameData.save()
+				updateRemoteLabels()
+			end,
+		})
+		:AddButton({
+			Text = "Use Dodge Remote",
+			Func = function()
+				GameDataRemotesDisabled()["Dodge"] = nil
+				GameData.save()
+				updateRemoteLabels()
+			end,
+		})
+
 	remoteBox:AddButton({
-		Text = "Clear Parry Remote",
+		Text = "Use ABS Remotes",
 		Func = function()
-			GameDataRemotes()["Parry"] = nil
-			GameData.save()
+			saveRemoteTemplate("Parry", RemotePresets.ABS.Parry)
+			saveRemoteTemplate("Dodge", RemotePresets.ABS.Dodge)
+
+			pcall(function()
+				Options.DefenseMode:SetValue("Remote")
+			end)
+
 			updateRemoteLabels()
+			Logger.notify("ABS parry/dodge remotes applied and remote mode enabled.")
 		end,
 	})
 
 	remoteBox:AddButton({
-		Text = "Clear Dodge Remote",
+		Text = "Delete Saved Remotes",
 		Func = function()
+			GameDataRemotes()["Parry"] = nil
 			GameDataRemotes()["Dodge"] = nil
+			GameDataRemotesDisabled()["Parry"] = nil
+			GameDataRemotesDisabled()["Dodge"] = nil
 			GameData.save()
 			updateRemoteLabels()
+			Logger.notify("Saved remotes deleted.")
 		end,
 	})
 
@@ -6204,7 +6355,7 @@ local function buildCombatTab(tab)
 	})
 
 	remoteBox:AddInput("RC_ManualArgs", {
-		Text = "Manual Args (Lua table)",
+		Text = "Manual Args (Lua table; $AIM_POS, $ENUM:X.Y, $LOCALPLAYER ok)",
 	})
 
 	remoteBox:AddButton({
