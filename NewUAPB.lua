@@ -4122,8 +4122,10 @@ end
 ---@class AutoLearn
 AutoLearn = {
 	maid = Maid.new(),
-	pending = {}, -- [track] = {entity, track, id, animName, startedAt, pressAt?, delayMs?, distance?, conn?}
+	pending = {}, -- [track] = {entity, track, id, animName, startedAt, hitAt?, delayMs?, distance?}
 	samples = {}, -- [id] = { delays = {}, distances = {} }
+	lastHealth = nil,
+	healthParent = nil, -- cached resolved parent instance holding the health value/property
 	ui = { statusLabel = nil, listLabel = nil },
 }
 
@@ -4140,6 +4142,12 @@ function AutoLearn.setIds(list)
 	GameData.data.autoLearnIds = list
 	GameData.save()
 	AutoLearn.updateListLabel()
+end
+
+---Configured HP path (persisted per game).
+---@return string
+function AutoLearn.healthPath()
+	return GameData.data.autoLearnHealthPath or ""
 end
 
 ---@param list string[]
@@ -4171,14 +4179,6 @@ end
 
 ---@param p table
 local function dropPending(p)
-	if p.conn then
-		pcall(function()
-			p.conn:Disconnect()
-		end)
-
-		p.conn = nil
-	end
-
 	AutoLearn.pending[p.track] = nil
 end
 
@@ -4190,40 +4190,117 @@ local function learnOption(name, fallback)
 	return (Options and Options[name] and Options[name].Value) or fallback
 end
 
----Called when a watched animation track stops.
----@param track AnimationTrack
-function AutoLearn.onStopped(track)
-	local p = AutoLearn.pending[track]
+---Read the local player's health. Blank path -> LocalPlayer Humanoid.Health, otherwise
+---resolve a dotted path (PLAYERNAME substitutes the local player name). Returns nil on failure.
+---@return number?
+function AutoLearn.readHealth()
+	local path = AutoLearn.healthPath()
 
-	if not p then
-		return
+	if path == "" then
+		local ok, result = pcall(function()
+			local character = localPlayer and localPlayer.Character
+
+			if not character then
+				return nil
+			end
+
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+			return humanoid and humanoid.Health or nil
+		end)
+
+		return ok and result or nil
 	end
 
-	dropPending(p)
+	-- Re-resolve the cached parent when it is missing or was destroyed (respawn).
+	if not AutoLearn.healthParent or AutoLearn.healthParent.Parent == nil then
+		local resolved = nil
 
-	if not p.pressAt then
-		AutoLearn.status("'%s' ended without a press", p.animName)
-		return
+		pcall(function()
+			local substituted = path:gsub("PLAYERNAME", localPlayer and localPlayer.Name or "")
+			local segments = {}
+
+			for segment in substituted:gmatch("[^%.]+") do
+				table.insert(segments, segment)
+			end
+
+			if segments[1] == "game" then
+				table.remove(segments, 1)
+			end
+
+			if #segments < 2 then
+				return
+			end
+
+			local current = nil
+			local okSvc, service = pcall(function()
+				return game:GetService(segments[1])
+			end)
+
+			if okSvc and service then
+				current = service
+			else
+				current = game:FindFirstChild(segments[1])
+			end
+
+			for index = 2, #segments - 1 do
+				if not current then
+					return
+				end
+
+				current = current:FindFirstChild(segments[index])
+			end
+
+			resolved = current
+		end)
+
+		AutoLearn.healthParent = resolved
 	end
 
-	if os.clock() - p.pressAt > learnOption("AutoLearnCancelWindow", 400) / 1000 then
-		AutoLearn.status("'%s' ended too late after press (not a parry)", p.animName)
-		return
+	local parent = AutoLearn.healthParent
+
+	if not parent then
+		return nil
 	end
 
-	-- Early-end check: a parried animation stops before its natural end.
-	local early = true
+	local last = nil
 
 	pcall(function()
-		early = track.Looped or track.Length <= 0 or (track.TimePosition < track.Length - 0.05)
+		local substituted = path:gsub("PLAYERNAME", localPlayer and localPlayer.Name or "")
+		local segments = {}
+
+		for segment in substituted:gmatch("[^%.]+") do
+			table.insert(segments, segment)
+		end
+
+		if segments[1] == "game" then
+			table.remove(segments, 1)
+		end
+
+		last = segments[#segments]
 	end)
 
-	if not early then
-		AutoLearn.status("'%s' played fully (not a parry)", p.animName)
-		return
+	if not last then
+		return nil
 	end
 
-	AutoLearn.commit(p)
+	local ok, result = pcall(function()
+		local target = parent:FindFirstChild(last)
+
+		if target and target:IsA("ValueBase") then
+			return target.Value
+		end
+
+		local value = parent[last]
+
+		if type(value) == "number" then
+			return value
+		end
+
+		return nil
+	end)
+
+	return ok and result or nil
 end
 
 ---Commit a learned sample into a timing.
@@ -4318,8 +4395,8 @@ function AutoLearn.commit(p)
 		refreshAllSections()
 	end
 
-	Logger.notify("Auto Learn: %s -> delay %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
-	AutoLearn.status("'%s' -> %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
+	Logger.notify("Auto Learn hit: %s -> delay %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
+	AutoLearn.status("'%s' hit -> %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
 end
 
 ---Handle an entity animation for auto learning.
@@ -4352,31 +4429,55 @@ function AutoLearn.onAnimation(entity, track)
 		startedAt = os.clock(),
 	}
 
-	p.conn = track.Stopped:Connect(function()
-		AutoLearn.onStopped(track)
-	end)
-
 	AutoLearn.pending[track] = p
 
-	local pressWindow = learnOption("AutoLearnPressWindow", 1500)
-	local cancelWindow = learnOption("AutoLearnCancelWindow", 400)
-	local length = 0
-
-	pcall(function()
-		length = track.Length
-	end)
-
-	task.delay((pressWindow + cancelWindow) / 1000 + math.max(length, 0) + 1, function()
+	-- Keep the pending alive for the whole damage window: the hit can land after
+	-- the animation track has already stopped.
+	task.delay(learnOption("AutoLearnDamageWindow", 2000) / 1000 + 0.1, function()
 		if AutoLearn.pending[track] == p then
 			dropPending(p)
-			AutoLearn.status("'%s' watch timed out", p.animName)
+			AutoLearn.status("'%s' - no HP change within window", p.animName)
 		end
 	end)
 end
 
----Start listening for manual parry presses.
+---Called when the polled HP changes; commits the most recent qualifying pending.
+function AutoLearn.onHealthChanged()
+	local now = os.clock()
+	local damageWindow = learnOption("AutoLearnDamageWindow", 2000)
+	local best = nil
+
+	for _, p in next, AutoLearn.pending do
+		if p.hitAt or now - p.startedAt > damageWindow / 1000 then
+			continue
+		end
+
+		local distance = entityDistance(p.entity)
+
+		if distance == nil then
+			continue
+		end
+
+		if not best or p.startedAt > best.startedAt then
+			best = p
+		end
+	end
+
+	if not best then
+		return
+	end
+
+	best.hitAt = now
+	best.delayMs = math.floor((now - best.startedAt) * 1000 + 0.5)
+	best.distance = entityDistance(best.entity)
+
+	dropPending(best)
+	AutoLearn.commit(best)
+end
+
+---Start polling the local player's HP.
 function AutoLearn.start()
-	AutoLearn.maid:mark(userInputService.InputBegan:Connect(function(input)
+	AutoLearn.maid:mark(runService.Heartbeat:Connect(function()
 		if UNLOADED then
 			return
 		end
@@ -4385,38 +4486,20 @@ function AutoLearn.start()
 			return
 		end
 
-		local keyName = (Options and Options.ParryKey and Options.ParryKey.Value) or "F"
-		local matched = false
+		local health = AutoLearn.readHealth()
+		local last = AutoLearn.lastHealth
+		AutoLearn.lastHealth = health
 
-		if keyName == "MB1" then
-			matched = input.UserInputType == Enum.UserInputType.MouseButton1
-		elseif keyName == "MB2" then
-			matched = input.UserInputType == Enum.UserInputType.MouseButton2
-		else
-			matched = input.KeyCode and input.KeyCode.Name == keyName
-		end
-
-		if not matched then
+		if health == nil or last == nil then
+			-- Respawn / unreadable: next valid read must not register as a change.
 			return
 		end
 
-		local now = os.clock()
-		local pressWindow = learnOption("AutoLearnPressWindow", 1500)
+		local changed = health ~= last
+		local anyChange = Toggles and Toggles.AutoLearnAnyChange and Toggles.AutoLearnAnyChange.Value
 
-		for _, p in next, AutoLearn.pending do
-			if p.pressAt or now - p.startedAt > pressWindow / 1000 then
-				continue
-			end
-
-			local distance = entityDistance(p.entity)
-
-			if distance == nil then
-				continue
-			end
-
-			p.pressAt = now
-			p.delayMs = math.floor((now - p.startedAt) * 1000 + 0.5)
-			p.distance = distance
+		if changed and (anyChange or health < last) then
+			AutoLearn.onHealthChanged()
 		end
 	end))
 end
@@ -4427,6 +4510,8 @@ function AutoLearn.stop()
 		dropPending(p)
 	end
 
+	AutoLearn.lastHealth = nil
+	AutoLearn.healthParent = nil
 	AutoLearn.maid:clean()
 end
 
@@ -6546,19 +6631,26 @@ local function buildToolsTab(tab)
 
 	AutoLearn.ui.listLabel = learnBox:AddLabel(string.format("Watching: %d IDs", #AutoLearn.ids()))
 
-	learnBox:AddSlider("AutoLearnPressWindow", {
-		Text = "Press Window (ms)",
-		Min = 100,
-		Max = 3000,
-		Default = 1500,
-		Rounding = 0,
+	learnBox:AddInput("AutoLearnHealthPath", {
+		Text = "HP Path (blank = LocalPlayer Humanoid.Health)",
+		Default = AutoLearn.healthPath(),
+		Callback = function(value)
+			GameData.data.autoLearnHealthPath = tostring(value)
+			GameData.save()
+			AutoLearn.healthParent = nil
+		end,
 	})
 
-	learnBox:AddSlider("AutoLearnCancelWindow", {
-		Text = "Cancel Window (ms)",
-		Min = 50,
-		Max = 1500,
-		Default = 400,
+	learnBox:AddToggle("AutoLearnAnyChange", {
+		Text = "Count Any HP Change (not just damage)",
+		Default = false,
+	})
+
+	learnBox:AddSlider("AutoLearnDamageWindow", {
+		Text = "Damage Window (ms)",
+		Min = 100,
+		Max = 5000,
+		Default = 2000,
 		Rounding = 0,
 	})
 
@@ -6577,7 +6669,9 @@ local function buildToolsTab(tab)
 
 	AutoLearn.ui.statusLabel = learnBox:AddLabel("Status: idle")
 
-	learnBox:AddLabel("Tip: disable Auto Parry while learning.")
+	learnBox:AddLabel(
+		"Get hit by the watched animation; delay = animation start -> HP change, hitbox = NPC distance at the hit."
+	)
 
 	local infoBox = tab:AddRightGroupbox("Info")
 
