@@ -63,6 +63,10 @@ local getrawmetatable = env("getrawmetatable")
 local identifyexecutor = env("identifyexecutor")
 local gethui = env("gethui")
 local setclipboard = env("setclipboard") or env("toclipboard")
+local gethiddenproperty = env("gethiddenproperty")
+local sethiddenproperty = env("sethiddenproperty")
+local setsimulationradius = env("setsimulationradius")
+local isnetworkowner = env("isnetworkowner")
 
 -- Linoria UI tables, assigned after the library loads.
 local Toggles
@@ -80,6 +84,7 @@ local replicatedStorage = game:GetService("ReplicatedStorage")
 local stats = game:GetService("Stats")
 local virtualInputManager = game:GetService("VirtualInputManager")
 local debris = game:GetService("Debris")
+local contextActionService = game:GetService("ContextActionService")
 local localPlayer = players.LocalPlayer
 
 -- Filesystem executor functions.
@@ -2196,30 +2201,6 @@ function RemoteResolver.fire(template)
 	return ok, err
 end
 
----Built-in remote templates for known games.
-local RemotePresets = {
-	ABS = {
-		Parry = {
-			path = 'game:GetService("Players").LocalPlayer.Remotes.RequestAction',
-			method = "InvokeServer",
-			args = {
-				"Parry",
-				"$ENUM:UserInputState.End",
-				{ MouseLock = false, MousePosition = "$AIM_POS" },
-			},
-		},
-		Dodge = {
-			path = 'game:GetService("Players").LocalPlayer.Remotes.RequestAction',
-			method = "InvokeServer",
-			args = {
-				"Roll",
-				"$ENUM:UserInputState.Begin",
-				{ MouseLock = false, MousePosition = "$AIM_POS" },
-			},
-		},
-	},
-}
-
 ---Persist a remote template into per-game data.
 ---@param name string
 ---@param template RemoteTemplate
@@ -3032,6 +3013,378 @@ local function createScreenGui(name)
 	end
 
 	return gui
+end
+
+--------------------------------------------------------------------------------
+-- Movement (Fly / NoClip / Pathfind Breaker / Void Mobs)
+--------------------------------------------------------------------------------
+
+---WASD movement input via ContextActionService (returns Pass so the game still sees input).
+local ControlModule = {
+	forwardValue = 0,
+	backwardValue = 0,
+	leftValue = 0,
+	rightValue = 0,
+	maid = Maid.new(),
+}
+
+---@param actionName string
+---@param keyCode Enum.KeyCode
+---@param onState fun(inputState: Enum.UserInputState)
+local function bindMoveAction(actionName, keyCode, onState)
+	ControlModule.maid:mark(function()
+		contextActionService:UnbindAction(actionName)
+	end)
+
+	contextActionService:BindAction(actionName, function(_, inputState)
+		onState(inputState)
+		return Enum.ContextActionResult.Pass
+	end, false, keyCode)
+end
+
+---Bind the WASD movement actions.
+function ControlModule.init()
+	bindMoveAction("ControlModule_ForwardValue", Enum.KeyCode.W, function(inputState)
+		ControlModule.forwardValue = (inputState == Enum.UserInputState.Begin) and -1 or 0
+	end)
+
+	bindMoveAction("ControlModule_LeftValue", Enum.KeyCode.A, function(inputState)
+		ControlModule.leftValue = (inputState == Enum.UserInputState.Begin) and -1 or 0
+	end)
+
+	bindMoveAction("ControlModule_BackwardValue", Enum.KeyCode.S, function(inputState)
+		ControlModule.backwardValue = (inputState == Enum.UserInputState.Begin) and 1 or 0
+	end)
+
+	bindMoveAction("ControlModule_RightValue", Enum.KeyCode.D, function(inputState)
+		ControlModule.rightValue = (inputState == Enum.UserInputState.Begin) and 1 or 0
+	end)
+end
+
+---Unbind the movement actions.
+function ControlModule.detach()
+	ControlModule.maid:clean()
+end
+
+---@return Vector3
+function ControlModule.getMoveVector()
+	return Vector3.new(
+		ControlModule.leftValue + ControlModule.rightValue,
+		0,
+		ControlModule.forwardValue + ControlModule.backwardValue
+	)
+end
+
+---@class Movement
+local Movement = {
+	maid = Maid.new(),
+	flyBV = nil,
+	noclipOriginal = {},
+	lastVelocity = nil,
+	highlight = nil,
+	voidMaid = Maid.new(),
+	allowSleepOriginal = nil,
+}
+
+-- Compare a part's hidden NetworkOwnerV3 to a freshly-created local part's value.
+local ownershipClientPeerId = nil
+local ownershipClientOk = false
+
+do
+	local ok, result = pcall(function()
+		if not gethiddenproperty then
+			return nil
+		end
+
+		local tempPart = Instance.new("Part")
+		tempPart.Parent = workspace
+
+		local peer = gethiddenproperty(tempPart, "NetworkOwnerV3")
+
+		tempPart:Destroy()
+
+		return peer
+	end)
+
+	ownershipClientOk = ok and result ~= nil
+	ownershipClientPeerId = result
+end
+
+---@param part BasePart
+---@return boolean
+local function hasNetworkOwnership(part)
+	local fallback = isnetworkowner or function()
+		return false
+	end
+
+	if not (gethiddenproperty and ownershipClientOk) then
+		return fallback(part)
+	end
+
+	local partSuccess, partPeerId = pcall(function()
+		return gethiddenproperty(part, "NetworkOwnerV3")
+	end)
+
+	if not partSuccess then
+		return fallback(part)
+	end
+
+	return partPeerId == ownershipClientPeerId
+end
+
+---Send a part to the void, ported from Exploits.lua.
+---@param part BasePart
+local function voidPart(part)
+	if not part:FindFirstChild("UAPB_Void") then
+		local velocity = Movement.voidMaid:mark(Instance.new("BodyVelocity"))
+		velocity.Name = "UAPB_Void"
+		velocity.MaxForce = Vector3.new(1 / 0, 1 / 0, 1 / 0)
+		velocity.Velocity = Vector3.new(100, -100000, 0)
+		velocity.P = 1 / 0
+		velocity.Parent = part
+	end
+
+	-- Remove part controllers.
+	local velocityController = part:FindFirstChild("ControlVel")
+		or part:FindFirstChild("SafetyBV")
+		or part:FindFirstChild("SwimBV")
+		or part:FindFirstChild("Holder")
+
+	if velocityController and velocityController:IsA("BodyMover") then
+		velocityController:Destroy()
+	end
+
+	part.AssemblyLinearVelocity = Vector3.new(1000, -10000, 0)
+	part.Position = Vector3.new(part.Position.X, -4000, part.Position.Z)
+	part.CanCollide = false
+
+	if sethiddenproperty then
+		pcall(sethiddenproperty, part, "NetworkIsSleeping", false)
+	end
+end
+
+---Void every tracked NPC we have network ownership of.
+local function updateVoidMobs()
+	if setsimulationradius then
+		pcall(setsimulationradius, math.huge, math.huge)
+	elseif sethiddenproperty then
+		pcall(function()
+			sethiddenproperty(localPlayer, "MaxSimulationRadius", 9e9)
+			sethiddenproperty(localPlayer, "SimulationRadius", 9e9)
+		end)
+	end
+
+	pcall(function()
+		if Movement.allowSleepOriginal == nil then
+			Movement.allowSleepOriginal = settings().Physics.AllowSleep
+		end
+
+		settings().Physics.AllowSleep = false
+	end)
+
+	for model in next, Entities.tracked do
+		if model == (localPlayer and localPlayer.Character) or players:GetPlayerFromCharacter(model) then
+			continue
+		end
+
+		local root = entityRoot(model)
+
+		if not root or not hasNetworkOwnership(root) then
+			continue
+		end
+
+		for _, instance in next, model:GetChildren() do
+			if instance:IsA("BasePart") then
+				instance.CanCollide = false
+			end
+
+			local bone = instance:FindFirstChild("Bone")
+
+			if bone and bone:IsA("BasePart") then
+				bone.CanCollide = false
+			end
+		end
+
+		voidPart(root)
+	end
+end
+
+---Clean up voided-mob movers and restore physics settings.
+local function cleanVoidMobs()
+	Movement.voidMaid:clean()
+
+	if Movement.allowSleepOriginal ~= nil then
+		pcall(function()
+			settings().Physics.AllowSleep = Movement.allowSleepOriginal
+		end)
+
+		Movement.allowSleepOriginal = nil
+	end
+end
+
+---NoClip + Fly, each physics step.
+function Movement.preSimulation()
+	local character = localPlayer and localPlayer.Character
+
+	if not character then
+		return
+	end
+
+	local root = entityRoot(character) or character:FindFirstChild("HumanoidRootPart")
+
+	if Toggles and Toggles.NoClip and Toggles.NoClip.Value then
+		for _, instance in next, character:GetDescendants() do
+			if not instance:IsA("BasePart") then
+				continue
+			end
+
+			if Movement.noclipOriginal[instance] == nil then
+				Movement.noclipOriginal[instance] = instance.CanCollide
+			end
+
+			instance.CanCollide = false
+		end
+	else
+		for part, canCollide in next, Movement.noclipOriginal do
+			pcall(function()
+				part.CanCollide = canCollide
+			end)
+		end
+
+		Movement.noclipOriginal = {}
+	end
+
+	if Toggles and Toggles.Fly and Toggles.Fly.Value and root then
+		pcall(function()
+			local controllerManager = character:FindFirstChild("ControllerManager")
+			local airController = controllerManager and controllerManager:FindFirstChild("AirController")
+
+			if airController then
+				controllerManager.ActiveController = airController
+			end
+		end)
+
+		local helioFlight = root:FindFirstChild("HelioFlight")
+
+		if helioFlight then
+			helioFlight:Destroy()
+		end
+
+		local camera = workspace and workspace.CurrentCamera
+
+		if camera then
+			if not Movement.flyBV or Movement.flyBV.Parent ~= root then
+				Movement.flyBV = Instance.new("BodyVelocity")
+				Movement.flyBV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+				Movement.flyBV.Parent = root
+			end
+
+			local velocity = camera.CFrame:VectorToWorldSpace(
+				ControlModule.getMoveVector() * ((Options.FlySpeed and Options.FlySpeed.Value) or 200)
+			)
+
+			if userInputService:IsKeyDown(Enum.KeyCode.Space) then
+				velocity = velocity + Vector3.new(0, (Options.FlyUpSpeed and Options.FlyUpSpeed.Value) or 150, 0)
+			end
+
+			Movement.flyBV.Velocity = velocity
+		end
+	else
+		if Movement.flyBV then
+			Movement.flyBV:Destroy()
+			Movement.flyBV = nil
+		end
+
+		pcall(function()
+			local controllerManager = character and character:FindFirstChild("ControllerManager")
+			local groundController = controllerManager and controllerManager:FindFirstChild("GroundController")
+
+			if groundController then
+				controllerManager.ActiveController = groundController
+			end
+		end)
+	end
+end
+
+---Pathfind Breaker + Void Mobs, each Heartbeat.
+function Movement.heartbeat()
+	local character = localPlayer and localPlayer.Character
+	local root = character and entityRoot(character)
+
+	if Toggles and Toggles.PathfindBreaker and Toggles.PathfindBreaker.Value and root then
+		Movement.lastVelocity = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity =
+			Vector3.new(0, (Toggles.AggressiveMode and Toggles.AggressiveMode.Value) and -1e5 or -9e9, 0)
+
+		if Toggles.PathfindBreakerHighlight and Toggles.PathfindBreakerHighlight.Value then
+			if not Movement.highlight or Movement.highlight.Parent ~= character then
+				Movement.highlight = Instance.new("Highlight")
+				Movement.highlight.Parent = character
+			end
+
+			Movement.highlight.FillColor = Options.PathfindBreakerHighlightColor.Value
+			Movement.highlight.OutlineColor = Options.PathfindBreakerHighlightOutlineColor.Value
+		elseif Movement.highlight then
+			Movement.highlight:Destroy()
+			Movement.highlight = nil
+		end
+	else
+		Movement.lastVelocity = nil
+
+		if Movement.highlight then
+			Movement.highlight:Destroy()
+			Movement.highlight = nil
+		end
+	end
+
+	if Toggles and Toggles.VoidMobs and Toggles.VoidMobs.Value then
+		updateVoidMobs()
+	else
+		cleanVoidMobs()
+	end
+end
+
+---Restore the real velocity so the client sees it for one frame.
+function Movement.preRender()
+	local character = localPlayer and localPlayer.Character
+	local root = character and entityRoot(character)
+
+	if Movement.lastVelocity and root then
+		root.AssemblyLinearVelocity = Movement.lastVelocity
+	end
+end
+
+---Start movement features.
+function Movement.start()
+	Movement.maid:mark(runService.PreSimulation:Connect(Movement.preSimulation))
+	Movement.maid:mark(runService.Heartbeat:Connect(Movement.heartbeat))
+	Movement.maid:mark(runService.PreRender:Connect(Movement.preRender))
+	ControlModule.init()
+end
+
+---Stop movement features and restore state.
+function Movement.stop()
+	for part, canCollide in next, Movement.noclipOriginal do
+		pcall(function()
+			part.CanCollide = canCollide
+		end)
+	end
+
+	Movement.noclipOriginal = {}
+
+	if Movement.flyBV then
+		Movement.flyBV:Destroy()
+		Movement.flyBV = nil
+	end
+
+	if Movement.highlight then
+		Movement.highlight:Destroy()
+		Movement.highlight = nil
+	end
+
+	cleanVoidMobs()
+	ControlModule.detach()
+	Movement.maid:clean()
 end
 
 --------------------------------------------------------------------------------
@@ -6316,21 +6669,6 @@ local function buildCombatTab(tab)
 		})
 
 	remoteBox:AddButton({
-		Text = "Use ABS Remotes",
-		Func = function()
-			saveRemoteTemplate("Parry", RemotePresets.ABS.Parry)
-			saveRemoteTemplate("Dodge", RemotePresets.ABS.Dodge)
-
-			pcall(function()
-				Options.DefenseMode:SetValue("Remote")
-			end)
-
-			updateRemoteLabels()
-			Logger.notify("ABS parry/dodge remotes applied and remote mode enabled.")
-		end,
-	})
-
-	remoteBox:AddButton({
 		Text = "Delete Saved Remotes",
 		Func = function()
 			GameDataRemotes()["Parry"] = nil
@@ -6397,6 +6735,114 @@ local function buildCombatTab(tab)
 
 			RemoteResolver.fire(template)
 		end,
+	})
+end
+
+---Build the Game tab.
+---@param tab table
+local function buildGameTab(tab)
+	local movementBox = tab:AddLeftGroupbox("Movement")
+
+	local flyToggle = movementBox:AddToggle("Fly", {
+		Text = "Fly",
+		Tooltip = "Set your character's velocity while moving to imitate flying.",
+		Default = false,
+	})
+
+	flyToggle:AddKeyPicker("FlyKeybind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "Fly",
+	})
+
+	local flyDepBox = movementBox:AddDependencyBox()
+
+	flyDepBox:AddSlider("FlySpeed", {
+		Text = "Fly Speed",
+		Default = 200,
+		Min = 0,
+		Max = 450,
+		Suffix = "/s",
+		Rounding = 0,
+	})
+
+	flyDepBox:AddSlider("FlyUpSpeed", {
+		Text = "Spacebar Fly Speed",
+		Default = 150,
+		Min = 0,
+		Max = 450,
+		Suffix = "/s",
+		Rounding = 0,
+	})
+
+	flyDepBox:SetupDependencies({
+		{ flyToggle, true },
+	})
+
+	local noclipToggle = movementBox:AddToggle("NoClip", {
+		Text = "NoClip",
+		Tooltip = "Disable collision(s) for your character.",
+		Default = false,
+	})
+
+	noclipToggle:AddKeyPicker("NoClipKeybind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "NoClip",
+	})
+
+	local exploitBox = tab:AddRightGroupbox("Exploits")
+
+	local voidMobsToggle = exploitBox:AddToggle("VoidMobs", {
+		Text = "Void Mobs",
+		Tooltip = "Teleport nearby mobs and send them to the void.",
+		Default = false,
+	})
+
+	voidMobsToggle:AddKeyPicker("VoidMobsKeyBind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "Void Mobs",
+	})
+
+	local pathfindBreakerToggle = exploitBox:AddToggle("PathfindBreaker", {
+		Text = "Pathfind Breaker",
+		Tooltip = "Visibly break the pathfinding for humanoid mobs by attempting to spoof your vertical velocity.",
+		Default = false,
+	})
+
+	pathfindBreakerToggle:AddKeyPicker("PathfindBreakerKeyBind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "Pathfind Breaker",
+	})
+
+	local pbDepBox = exploitBox:AddDependencyBox()
+
+	pbDepBox:AddToggle("AggressiveMode", {
+		Text = "Aggressive Mode",
+		Tooltip = "Enable this to make the pathfinding breaker more aggressive by luring mobs towards you.",
+		Default = false,
+	})
+
+	local pbHighlightToggle = pbDepBox:AddToggle("PathfindBreakerHighlight", {
+		Text = "Show Highlight",
+		Tooltip = "Because this feature can be very visible, you can enable a visual highlight to see if it is on.",
+		Default = false,
+	})
+
+	pbHighlightToggle:AddColorPicker("PathfindBreakerHighlightColor", {
+		Default = Color3.fromRGB(200, 0, 255),
+		Text = "Highlight Color",
+	})
+
+	pbHighlightToggle:AddColorPicker("PathfindBreakerHighlightOutlineColor", {
+		Default = Color3.fromRGB(255, 152, 234),
+		Text = "Outline Color",
+	})
+
+	pbDepBox:SetupDependencies({
+		{ pathfindBreakerToggle, true },
 	})
 end
 
@@ -7025,6 +7471,7 @@ local function unload()
 		DifferenceCalculator.maid:clean()
 	end)
 	pcall(AutoLearn.stop)
+	pcall(Movement.stop)
 	pcall(function()
 		for _, state in next, Entities.tracked do
 			state.maid:clean()
@@ -7070,11 +7517,13 @@ local function init()
 	})
 
 	local combatTab = Window:AddTab("Combat")
+	local gameTab = Window:AddTab("Game")
 	local builderTab = Window:AddTab("Builder")
 	local toolsTab = Window:AddTab("Tools")
 	local settingsTab = Window:AddTab("Settings")
 
 	buildCombatTab(combatTab)
+	buildGameTab(gameTab)
 	builderUI = buildBuilderTab(builderTab)
 	buildToolsTab(toolsTab)
 	buildSettingsTab(settingsTab)
@@ -7090,6 +7539,7 @@ local function init()
 	DifferenceCalculator.start()
 	AutoLearn.start()
 	Entities.start()
+	Movement.start()
 
 	rootMaid:mark(runService.Heartbeat:Connect(onHeartbeat))
 	rootMaid:mark(runService.RenderStepped:Connect(InfoLogger.renderStepped))
@@ -7097,6 +7547,7 @@ local function init()
 	rootMaid:mark(Entities.maid)
 	rootMaid:mark(DifferenceCalculator.maid)
 	rootMaid:mark(AutoLearn.maid)
+	rootMaid:mark(Movement.maid)
 
 	Library:OnUnload(unload)
 
