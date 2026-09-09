@@ -1796,6 +1796,7 @@ end
 ---@field name string
 
 local GameDataRemotes -- alias kept for readability: GameData.data.remotes
+local GameDataRemotesDisabled -- GameData.data.remotesDisabled
 
 ---@class RemoteResolver
 local RemoteResolver = {
