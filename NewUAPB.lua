@@ -1813,13 +1813,107 @@ local function isRemote(inst)
 	return inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent")
 end
 
----Walk a dotted path from game, supporting names containing '.' via a last-segment descendant match.
+---Parse a Lua-style instance path into { root = Instance, segments = string[] }.
+---Accepts: `game:GetService("X")`, `game.X`, `workspace`, `game.Workspace`, `Players.LocalPlayer`,
+---bracket indexing `["Name with spaces"]`, and the literal token PLAYERNAME (-> localPlayer.Name).
+---@param path string
+---@return Instance?, string[]
+local function parseInstancePath(path)
+	local text = tostring(path or ""):gsub("PLAYERNAME", localPlayer and localPlayer.Name or "")
+	text = text:gsub("^%s+", ""):gsub("%s+$", "")
+
+	local segments = {}
+	local root = nil
+	local pos, len = 1, #text
+
+	while pos <= len do
+		local progressed = false
+		local _, name, nextpos = text:match('^%s*[%a_][%w_]*%s*:%s*GetService%s*%(%s*"([^"]*)"%s*%)()', pos)
+
+		if not name then
+			_, name, nextpos = text:match("^%s*[%a_][%w_]*%s*:%s*GetService%s*%(%s*'([^']*)'%s*%)()", pos)
+		end
+
+		if not name then
+			_, name, nextpos = text:match("^%s*[%a_][%w_]*%s*:%s*GetService%s*%(%s*%[%[(.-)%]%]%s*%)()", pos)
+		end
+
+		if name then
+			local ok, svc = pcall(game.GetService, game, name)
+
+			if ok then
+				root = svc
+			end
+
+			pos = nextpos
+			progressed = true
+		else
+			local segment = nil
+			segment, nextpos = text:match('^%s*%[%s*"([^"]*)"%s*%]()', pos)
+
+			if not segment then
+				segment, nextpos = text:match("^%s*%[%s*'([^']*)'%s*%]()", pos)
+			end
+
+			if not segment then
+				segment, nextpos = text:match("^%s*([%w_]+)()", pos)
+			end
+
+			if segment then
+				table.insert(segments, segment)
+				pos = nextpos
+				progressed = true
+			end
+		end
+
+		-- Consume a '.' separator (or any other stray delimiter).
+		local sep = text:match("^%s*[%.:%(%)]*%s*()", pos)
+
+		if sep and sep > pos then
+			pos = sep
+		elseif not progressed then
+			pos = pos + 1
+		end
+	end
+
+	if not root then
+		local first = segments[1]
+
+		if first == "game" then
+			root = game
+			table.remove(segments, 1)
+		elseif first == "workspace" or first == "Workspace" then
+			root = workspace
+			table.remove(segments, 1)
+		elseif first then
+			local ok, svc = pcall(game.GetService, game, first)
+
+			if ok and svc then
+				root = svc
+				table.remove(segments, 1)
+			else
+				root = game
+			end
+		end
+	end
+
+	-- `Players.LocalPlayer` resolves to the local player instance.
+	if root == players and segments[1] == "LocalPlayer" then
+		root = localPlayer
+		table.remove(segments, 1)
+	end
+
+	return root, segments
+end
+
+---Walk a path from game, supporting names containing '.' via a last-segment descendant match.
 ---@param path string
 ---@return Instance?
 local function walkPath(path)
-	local current = game
+	local root, segments = parseInstancePath(path)
+	local current = root
 
-	for segment in string.gmatch(path, "[^%.]+") do
+	for _, segment in next, segments do
 		current = current and current:FindFirstChild(segment)
 
 		if not current then
@@ -1832,7 +1926,7 @@ local function walkPath(path)
 	end
 
 	-- Last-segment descendant match for names containing dots or non-direct paths.
-	local last = path:match("([^%.]+)$")
+	local last = segments[#segments]
 
 	if not last then
 		return nil
@@ -1859,7 +1953,8 @@ function RemoteResolver.resolve(pathOrName)
 		return nil
 	end
 
-	local name = pathOrName:match("([^%.]+)$") or pathOrName
+	local _, nameSegments = parseInstancePath(pathOrName)
+	local name = nameSegments[#nameSegments] or pathOrName
 
 	if RemoteResolver.cache[pathOrName] then
 		local cached = RemoteResolver.cache[pathOrName]
@@ -1871,8 +1966,8 @@ function RemoteResolver.resolve(pathOrName)
 		RemoteResolver.cache[pathOrName] = nil
 	end
 
-	-- 1. Walk the dotted path.
-	if pathOrName:find("%.") then
+	-- 1. Walk the path.
+	if pathOrName:find("[%s%.:%[%]]") then
 		local inst = walkPath(pathOrName)
 
 		if inst then
@@ -4212,38 +4307,20 @@ function AutoLearn.readHealth()
 		return ok and result or nil
 	end
 
+	local root, segments = parseInstancePath(path)
+
+	if not root or #segments == 0 then
+		return nil
+	end
+
 	-- Re-resolve the cached parent when it is missing or was destroyed (respawn).
 	if not AutoLearn.healthParent or AutoLearn.healthParent.Parent == nil then
 		local resolved = nil
 
 		pcall(function()
-			local substituted = path:gsub("PLAYERNAME", localPlayer and localPlayer.Name or "")
-			local segments = {}
+			local current = root
 
-			for segment in substituted:gmatch("[^%.]+") do
-				table.insert(segments, segment)
-			end
-
-			if segments[1] == "game" then
-				table.remove(segments, 1)
-			end
-
-			if #segments < 2 then
-				return
-			end
-
-			local current = nil
-			local okSvc, service = pcall(function()
-				return game:GetService(segments[1])
-			end)
-
-			if okSvc and service then
-				current = service
-			else
-				current = game:FindFirstChild(segments[1])
-			end
-
-			for index = 2, #segments - 1 do
+			for index = 1, #segments - 1 do
 				if not current then
 					return
 				end
@@ -4263,26 +4340,7 @@ function AutoLearn.readHealth()
 		return nil
 	end
 
-	local last = nil
-
-	pcall(function()
-		local substituted = path:gsub("PLAYERNAME", localPlayer and localPlayer.Name or "")
-		local segments = {}
-
-		for segment in substituted:gmatch("[^%.]+") do
-			table.insert(segments, segment)
-		end
-
-		if segments[1] == "game" then
-			table.remove(segments, 1)
-		end
-
-		last = segments[#segments]
-	end)
-
-	if not last then
-		return nil
-	end
+	local last = segments[#segments]
 
 	local ok, result = pcall(function()
 		local target = parent:FindFirstChild(last)
@@ -6129,7 +6187,7 @@ local function buildCombatTab(tab)
 	remoteBox:AddDivider()
 
 	remoteBox:AddInput("RC_ManualPath", {
-		Text = "Manual Remote Path",
+		Text = 'Manual Remote Path (game:GetService("X").A.B OK)',
 	})
 
 	remoteBox:AddDropdown("RC_ManualMethod", {
@@ -6632,7 +6690,7 @@ local function buildToolsTab(tab)
 	AutoLearn.ui.listLabel = learnBox:AddLabel(string.format("Watching: %d IDs", #AutoLearn.ids()))
 
 	learnBox:AddInput("AutoLearnHealthPath", {
-		Text = "HP Path (blank = LocalPlayer Humanoid.Health)",
+		Text = "HP Path (blank = LocalPlayer Humanoid.Health; game:GetService(...) paths OK)",
 		Default = AutoLearn.healthPath(),
 		Callback = function(value)
 			GameData.data.autoLearnHealthPath = tostring(value)
