@@ -1882,6 +1882,13 @@ local function parseInstancePath(path)
 		if first == "game" then
 			root = game
 			table.remove(segments, 1)
+
+			local ok, svc = pcall(game.GetService, game, segments[1] or "")
+
+			if ok and svc then
+				root = svc
+				table.remove(segments, 1)
+			end
 		elseif first == "workspace" or first == "Workspace" then
 			root = workspace
 			table.remove(segments, 1)
