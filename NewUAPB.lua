@@ -63,6 +63,10 @@ local getrawmetatable = env("getrawmetatable")
 local identifyexecutor = env("identifyexecutor")
 local gethui = env("gethui")
 local setclipboard = env("setclipboard") or env("toclipboard")
+local gethiddenproperty = env("gethiddenproperty")
+local sethiddenproperty = env("sethiddenproperty")
+local setsimulationradius = env("setsimulationradius")
+local isnetworkowner = env("isnetworkowner")
 
 -- Linoria UI tables, assigned after the library loads.
 local Toggles
@@ -80,6 +84,7 @@ local replicatedStorage = game:GetService("ReplicatedStorage")
 local stats = game:GetService("Stats")
 local virtualInputManager = game:GetService("VirtualInputManager")
 local debris = game:GetService("Debris")
+local contextActionService = game:GetService("ContextActionService")
 local localPlayer = players.LocalPlayer
 
 -- Filesystem executor functions.
@@ -1796,6 +1801,7 @@ end
 ---@field name string
 
 local GameDataRemotes -- alias kept for readability: GameData.data.remotes
+local GameDataRemotesDisabled -- GameData.data.remotesDisabled
 
 ---@class RemoteResolver
 local RemoteResolver = {
@@ -1813,13 +1819,114 @@ local function isRemote(inst)
 	return inst:IsA("RemoteEvent") or inst:IsA("RemoteFunction") or inst:IsA("UnreliableRemoteEvent")
 end
 
----Walk a dotted path from game, supporting names containing '.' via a last-segment descendant match.
+---Parse a Lua-style instance path into { root = Instance, segments = string[] }.
+---Accepts: `game:GetService("X")`, `game.X`, `workspace`, `game.Workspace`, `Players.LocalPlayer`,
+---bracket indexing `["Name with spaces"]`, and the literal token PLAYERNAME (-> localPlayer.Name).
+---@param path string
+---@return Instance?, string[]
+local function parseInstancePath(path)
+	local text = tostring(path or ""):gsub("PLAYERNAME", localPlayer and localPlayer.Name or "")
+	text = text:gsub("^%s+", ""):gsub("%s+$", "")
+
+	local segments = {}
+	local root = nil
+	local pos, len = 1, #text
+
+	while pos <= len do
+		local progressed = false
+		local _, name, nextpos = text:match('^%s*[%a_][%w_]*%s*:%s*GetService%s*%(%s*"([^"]*)"%s*%)()', pos)
+
+		if not name then
+			_, name, nextpos = text:match("^%s*[%a_][%w_]*%s*:%s*GetService%s*%(%s*'([^']*)'%s*%)()", pos)
+		end
+
+		if not name then
+			_, name, nextpos = text:match("^%s*[%a_][%w_]*%s*:%s*GetService%s*%(%s*%[%[(.-)%]%]%s*%)()", pos)
+		end
+
+		if name then
+			local ok, svc = pcall(game.GetService, game, name)
+
+			if ok then
+				root = svc
+			end
+
+			pos = nextpos
+			progressed = true
+		else
+			local segment = nil
+			segment, nextpos = text:match('^%s*%[%s*"([^"]*)"%s*%]()', pos)
+
+			if not segment then
+				segment, nextpos = text:match("^%s*%[%s*'([^']*)'%s*%]()", pos)
+			end
+
+			if not segment then
+				segment, nextpos = text:match("^%s*([%w_]+)()", pos)
+			end
+
+			if segment then
+				table.insert(segments, segment)
+				pos = nextpos
+				progressed = true
+			end
+		end
+
+		-- Consume a '.' separator (or any other stray delimiter).
+		local sep = text:match("^%s*[%.:%(%)]*%s*()", pos)
+
+		if sep and sep > pos then
+			pos = sep
+		elseif not progressed then
+			pos = pos + 1
+		end
+	end
+
+	if not root then
+		local first = segments[1]
+
+		if first == "game" then
+			root = game
+			table.remove(segments, 1)
+
+			local ok, svc = pcall(game.GetService, game, segments[1] or "")
+
+			if ok and svc then
+				root = svc
+				table.remove(segments, 1)
+			end
+		elseif first == "workspace" or first == "Workspace" then
+			root = workspace
+			table.remove(segments, 1)
+		elseif first then
+			local ok, svc = pcall(game.GetService, game, first)
+
+			if ok and svc then
+				root = svc
+				table.remove(segments, 1)
+			else
+				root = game
+			end
+		end
+	end
+
+	-- `Players.LocalPlayer` resolves to the local player instance.
+	if root == players and segments[1] == "LocalPlayer" then
+		root = localPlayer
+		table.remove(segments, 1)
+	end
+
+	return root, segments
+end
+
+---Walk a path from game, supporting names containing '.' via a last-segment descendant match.
 ---@param path string
 ---@return Instance?
 local function walkPath(path)
-	local current = game
+	local root, segments = parseInstancePath(path)
+	local current = root
 
-	for segment in string.gmatch(path, "[^%.]+") do
+	for _, segment in next, segments do
 		current = current and current:FindFirstChild(segment)
 
 		if not current then
@@ -1832,7 +1939,7 @@ local function walkPath(path)
 	end
 
 	-- Last-segment descendant match for names containing dots or non-direct paths.
-	local last = path:match("([^%.]+)$")
+	local last = segments[#segments]
 
 	if not last then
 		return nil
@@ -1859,7 +1966,8 @@ function RemoteResolver.resolve(pathOrName)
 		return nil
 	end
 
-	local name = pathOrName:match("([^%.]+)$") or pathOrName
+	local _, nameSegments = parseInstancePath(pathOrName)
+	local name = nameSegments[#nameSegments] or pathOrName
 
 	if RemoteResolver.cache[pathOrName] then
 		local cached = RemoteResolver.cache[pathOrName]
@@ -1871,8 +1979,8 @@ function RemoteResolver.resolve(pathOrName)
 		RemoteResolver.cache[pathOrName] = nil
 	end
 
-	-- 1. Walk the dotted path.
-	if pathOrName:find("%.") then
+	-- 1. Walk the path.
+	if pathOrName:find("[%s%.:%[%]]") then
 		local inst = walkPath(pathOrName)
 
 		if inst then
@@ -1989,6 +2097,42 @@ function RemoteResolver.substituteArgs(args)
 				resolved = mouse and mouse.Hit or CFrame.new()
 			elseif value == "$CAMERA_CF" then
 				resolved = camera and camera.CFrame or CFrame.new()
+			elseif value == "$AIM_POS" then
+				resolved = Vector3.zero
+				pcall(function()
+					if not camera then
+						return
+					end
+
+					local origin = camera.CFrame.Position
+					local direction = camera.CFrame.LookVector * 1000
+					local params = RaycastParams.new()
+					params.FilterType = Enum.RaycastFilterType.Exclude
+					params.FilterDescendantsInstances = character and { character } or {}
+
+					local hit = workspace:Raycast(origin, direction, params)
+
+					resolved = (hit and hit.Position) or (origin + direction)
+				end)
+			elseif value:sub(1, 6) == "$ENUM:" then
+				resolved = nil
+
+				local enumText = value:sub(7)
+				local familyName, itemName = enumText:match("^([^%.]+)%.(.+)$")
+
+				if familyName and itemName then
+					local ok, enumValue = pcall(function()
+						return Enum[familyName][itemName]
+					end)
+
+					if ok and enumValue ~= nil then
+						resolved = enumValue
+					else
+						Logger.warn("Could not resolve enum marker '%s'.", value)
+					end
+				else
+					Logger.warn("Malformed enum marker '%s' (expected $ENUM:Family.Item).", value)
+				end
 			elseif value:sub(1, 10) == "$INSTANCE:" then
 				resolved = resolveInstancePath(value:sub(11))
 			end
@@ -2032,6 +2176,21 @@ function RemoteResolver.fire(template)
 	end
 
 	local args = RemoteResolver.substituteArgs(template.args or {})
+
+	if method == "InvokeServer" then
+		-- InvokeServer yields for a response; spawn it so the defense thread isn't blocked.
+		task.spawn(function()
+			local ok, err = pcall(remote[method], remote, unpackFn(args))
+
+			if not ok then
+				RemoteResolver.cache[template.path or template.name] = nil
+				Logger.warn("Remote '%s' failed: %s", template.path or template.name, err)
+			end
+		end)
+
+		return true
+	end
+
 	local ok, err = pcall(remote[method], remote, unpackFn(args))
 
 	if not ok then
@@ -2053,6 +2212,9 @@ local function saveRemoteTemplate(name, template)
 		name = name,
 	}
 
+	-- Saving a template re-enables that kind.
+	GameDataRemotesDisabled()[name] = nil
+
 	GameData.save()
 end
 
@@ -2060,6 +2222,13 @@ end
 function GameDataRemotes()
 	GameData.data.remotes = GameData.data.remotes or {}
 	return GameData.data.remotes
+end
+
+---Per-game map of remote kinds the user disabled without deleting.
+---@return table
+function GameDataRemotesDisabled()
+	GameData.data.remotesDisabled = GameData.data.remotesDisabled or {}
+	return GameData.data.remotesDisabled
 end
 
 --------------------------------------------------------------------------------
@@ -2145,6 +2314,10 @@ local function fireDefenseRemote(kind)
 	end
 
 	local template = GameDataRemotes()[kind]
+
+	if GameDataRemotesDisabled()[kind] then
+		template = nil
+	end
 
 	if template then
 		RemoteResolver.fire(template)
@@ -2840,6 +3013,378 @@ local function createScreenGui(name)
 	end
 
 	return gui
+end
+
+--------------------------------------------------------------------------------
+-- Movement (Fly / NoClip / Pathfind Breaker / Void Mobs)
+--------------------------------------------------------------------------------
+
+---WASD movement input via ContextActionService (returns Pass so the game still sees input).
+local ControlModule = {
+	forwardValue = 0,
+	backwardValue = 0,
+	leftValue = 0,
+	rightValue = 0,
+	maid = Maid.new(),
+}
+
+---@param actionName string
+---@param keyCode Enum.KeyCode
+---@param onState fun(inputState: Enum.UserInputState)
+local function bindMoveAction(actionName, keyCode, onState)
+	ControlModule.maid:mark(function()
+		contextActionService:UnbindAction(actionName)
+	end)
+
+	contextActionService:BindAction(actionName, function(_, inputState)
+		onState(inputState)
+		return Enum.ContextActionResult.Pass
+	end, false, keyCode)
+end
+
+---Bind the WASD movement actions.
+function ControlModule.init()
+	bindMoveAction("ControlModule_ForwardValue", Enum.KeyCode.W, function(inputState)
+		ControlModule.forwardValue = (inputState == Enum.UserInputState.Begin) and -1 or 0
+	end)
+
+	bindMoveAction("ControlModule_LeftValue", Enum.KeyCode.A, function(inputState)
+		ControlModule.leftValue = (inputState == Enum.UserInputState.Begin) and -1 or 0
+	end)
+
+	bindMoveAction("ControlModule_BackwardValue", Enum.KeyCode.S, function(inputState)
+		ControlModule.backwardValue = (inputState == Enum.UserInputState.Begin) and 1 or 0
+	end)
+
+	bindMoveAction("ControlModule_RightValue", Enum.KeyCode.D, function(inputState)
+		ControlModule.rightValue = (inputState == Enum.UserInputState.Begin) and 1 or 0
+	end)
+end
+
+---Unbind the movement actions.
+function ControlModule.detach()
+	ControlModule.maid:clean()
+end
+
+---@return Vector3
+function ControlModule.getMoveVector()
+	return Vector3.new(
+		ControlModule.leftValue + ControlModule.rightValue,
+		0,
+		ControlModule.forwardValue + ControlModule.backwardValue
+	)
+end
+
+---@class Movement
+local Movement = {
+	maid = Maid.new(),
+	flyBV = nil,
+	noclipOriginal = {},
+	lastVelocity = nil,
+	highlight = nil,
+	voidMaid = Maid.new(),
+	allowSleepOriginal = nil,
+}
+
+-- Compare a part's hidden NetworkOwnerV3 to a freshly-created local part's value.
+local ownershipClientPeerId = nil
+local ownershipClientOk = false
+
+do
+	local ok, result = pcall(function()
+		if not gethiddenproperty then
+			return nil
+		end
+
+		local tempPart = Instance.new("Part")
+		tempPart.Parent = workspace
+
+		local peer = gethiddenproperty(tempPart, "NetworkOwnerV3")
+
+		tempPart:Destroy()
+
+		return peer
+	end)
+
+	ownershipClientOk = ok and result ~= nil
+	ownershipClientPeerId = result
+end
+
+---@param part BasePart
+---@return boolean
+local function hasNetworkOwnership(part)
+	local fallback = isnetworkowner or function()
+		return false
+	end
+
+	if not (gethiddenproperty and ownershipClientOk) then
+		return fallback(part)
+	end
+
+	local partSuccess, partPeerId = pcall(function()
+		return gethiddenproperty(part, "NetworkOwnerV3")
+	end)
+
+	if not partSuccess then
+		return fallback(part)
+	end
+
+	return partPeerId == ownershipClientPeerId
+end
+
+---Send a part to the void, ported from Exploits.lua.
+---@param part BasePart
+local function voidPart(part)
+	if not part:FindFirstChild("UAPB_Void") then
+		local velocity = Movement.voidMaid:mark(Instance.new("BodyVelocity"))
+		velocity.Name = "UAPB_Void"
+		velocity.MaxForce = Vector3.new(1 / 0, 1 / 0, 1 / 0)
+		velocity.Velocity = Vector3.new(100, -100000, 0)
+		velocity.P = 1 / 0
+		velocity.Parent = part
+	end
+
+	-- Remove part controllers.
+	local velocityController = part:FindFirstChild("ControlVel")
+		or part:FindFirstChild("SafetyBV")
+		or part:FindFirstChild("SwimBV")
+		or part:FindFirstChild("Holder")
+
+	if velocityController and velocityController:IsA("BodyMover") then
+		velocityController:Destroy()
+	end
+
+	part.AssemblyLinearVelocity = Vector3.new(1000, -10000, 0)
+	part.Position = Vector3.new(part.Position.X, -4000, part.Position.Z)
+	part.CanCollide = false
+
+	if sethiddenproperty then
+		pcall(sethiddenproperty, part, "NetworkIsSleeping", false)
+	end
+end
+
+---Void every tracked NPC we have network ownership of.
+local function updateVoidMobs()
+	if setsimulationradius then
+		pcall(setsimulationradius, math.huge, math.huge)
+	elseif sethiddenproperty then
+		pcall(function()
+			sethiddenproperty(localPlayer, "MaxSimulationRadius", 9e9)
+			sethiddenproperty(localPlayer, "SimulationRadius", 9e9)
+		end)
+	end
+
+	pcall(function()
+		if Movement.allowSleepOriginal == nil then
+			Movement.allowSleepOriginal = settings().Physics.AllowSleep
+		end
+
+		settings().Physics.AllowSleep = false
+	end)
+
+	for model in next, Entities.tracked do
+		if model == (localPlayer and localPlayer.Character) or players:GetPlayerFromCharacter(model) then
+			continue
+		end
+
+		local root = entityRoot(model)
+
+		if not root or not hasNetworkOwnership(root) then
+			continue
+		end
+
+		for _, instance in next, model:GetChildren() do
+			if instance:IsA("BasePart") then
+				instance.CanCollide = false
+			end
+
+			local bone = instance:FindFirstChild("Bone")
+
+			if bone and bone:IsA("BasePart") then
+				bone.CanCollide = false
+			end
+		end
+
+		voidPart(root)
+	end
+end
+
+---Clean up voided-mob movers and restore physics settings.
+local function cleanVoidMobs()
+	Movement.voidMaid:clean()
+
+	if Movement.allowSleepOriginal ~= nil then
+		pcall(function()
+			settings().Physics.AllowSleep = Movement.allowSleepOriginal
+		end)
+
+		Movement.allowSleepOriginal = nil
+	end
+end
+
+---NoClip + Fly, each physics step.
+function Movement.preSimulation()
+	local character = localPlayer and localPlayer.Character
+
+	if not character then
+		return
+	end
+
+	local root = entityRoot(character) or character:FindFirstChild("HumanoidRootPart")
+
+	if Toggles and Toggles.NoClip and Toggles.NoClip.Value then
+		for _, instance in next, character:GetDescendants() do
+			if not instance:IsA("BasePart") then
+				continue
+			end
+
+			if Movement.noclipOriginal[instance] == nil then
+				Movement.noclipOriginal[instance] = instance.CanCollide
+			end
+
+			instance.CanCollide = false
+		end
+	else
+		for part, canCollide in next, Movement.noclipOriginal do
+			pcall(function()
+				part.CanCollide = canCollide
+			end)
+		end
+
+		Movement.noclipOriginal = {}
+	end
+
+	if Toggles and Toggles.Fly and Toggles.Fly.Value and root then
+		pcall(function()
+			local controllerManager = character:FindFirstChild("ControllerManager")
+			local airController = controllerManager and controllerManager:FindFirstChild("AirController")
+
+			if airController then
+				controllerManager.ActiveController = airController
+			end
+		end)
+
+		local helioFlight = root:FindFirstChild("HelioFlight")
+
+		if helioFlight then
+			helioFlight:Destroy()
+		end
+
+		local camera = workspace and workspace.CurrentCamera
+
+		if camera then
+			if not Movement.flyBV or Movement.flyBV.Parent ~= root then
+				Movement.flyBV = Instance.new("BodyVelocity")
+				Movement.flyBV.MaxForce = Vector3.new(9e9, 9e9, 9e9)
+				Movement.flyBV.Parent = root
+			end
+
+			local velocity = camera.CFrame:VectorToWorldSpace(
+				ControlModule.getMoveVector() * ((Options.FlySpeed and Options.FlySpeed.Value) or 200)
+			)
+
+			if userInputService:IsKeyDown(Enum.KeyCode.Space) then
+				velocity = velocity + Vector3.new(0, (Options.FlyUpSpeed and Options.FlyUpSpeed.Value) or 150, 0)
+			end
+
+			Movement.flyBV.Velocity = velocity
+		end
+	else
+		if Movement.flyBV then
+			Movement.flyBV:Destroy()
+			Movement.flyBV = nil
+		end
+
+		pcall(function()
+			local controllerManager = character and character:FindFirstChild("ControllerManager")
+			local groundController = controllerManager and controllerManager:FindFirstChild("GroundController")
+
+			if groundController then
+				controllerManager.ActiveController = groundController
+			end
+		end)
+	end
+end
+
+---Pathfind Breaker + Void Mobs, each Heartbeat.
+function Movement.heartbeat()
+	local character = localPlayer and localPlayer.Character
+	local root = character and entityRoot(character)
+
+	if Toggles and Toggles.PathfindBreaker and Toggles.PathfindBreaker.Value and root then
+		Movement.lastVelocity = root.AssemblyLinearVelocity
+		root.AssemblyLinearVelocity =
+			Vector3.new(0, (Toggles.AggressiveMode and Toggles.AggressiveMode.Value) and -1e5 or -9e9, 0)
+
+		if Toggles.PathfindBreakerHighlight and Toggles.PathfindBreakerHighlight.Value then
+			if not Movement.highlight or Movement.highlight.Parent ~= character then
+				Movement.highlight = Instance.new("Highlight")
+				Movement.highlight.Parent = character
+			end
+
+			Movement.highlight.FillColor = Options.PathfindBreakerHighlightColor.Value
+			Movement.highlight.OutlineColor = Options.PathfindBreakerHighlightOutlineColor.Value
+		elseif Movement.highlight then
+			Movement.highlight:Destroy()
+			Movement.highlight = nil
+		end
+	else
+		Movement.lastVelocity = nil
+
+		if Movement.highlight then
+			Movement.highlight:Destroy()
+			Movement.highlight = nil
+		end
+	end
+
+	if Toggles and Toggles.VoidMobs and Toggles.VoidMobs.Value then
+		updateVoidMobs()
+	else
+		cleanVoidMobs()
+	end
+end
+
+---Restore the real velocity so the client sees it for one frame.
+function Movement.preRender()
+	local character = localPlayer and localPlayer.Character
+	local root = character and entityRoot(character)
+
+	if Movement.lastVelocity and root then
+		root.AssemblyLinearVelocity = Movement.lastVelocity
+	end
+end
+
+---Start movement features.
+function Movement.start()
+	Movement.maid:mark(runService.PreSimulation:Connect(Movement.preSimulation))
+	Movement.maid:mark(runService.Heartbeat:Connect(Movement.heartbeat))
+	Movement.maid:mark(runService.PreRender:Connect(Movement.preRender))
+	ControlModule.init()
+end
+
+---Stop movement features and restore state.
+function Movement.stop()
+	for part, canCollide in next, Movement.noclipOriginal do
+		pcall(function()
+			part.CanCollide = canCollide
+		end)
+	end
+
+	Movement.noclipOriginal = {}
+
+	if Movement.flyBV then
+		Movement.flyBV:Destroy()
+		Movement.flyBV = nil
+	end
+
+	if Movement.highlight then
+		Movement.highlight:Destroy()
+		Movement.highlight = nil
+	end
+
+	cleanVoidMobs()
+	ControlModule.detach()
+	Movement.maid:clean()
 end
 
 --------------------------------------------------------------------------------
@@ -4122,8 +4667,10 @@ end
 ---@class AutoLearn
 AutoLearn = {
 	maid = Maid.new(),
-	pending = {}, -- [track] = {entity, track, id, animName, startedAt, pressAt?, delayMs?, distance?, conn?}
+	pending = {}, -- [track] = {entity, track, id, animName, startedAt, hitAt?, delayMs?, distance?}
 	samples = {}, -- [id] = { delays = {}, distances = {} }
+	lastHealth = nil,
+	healthParent = nil, -- cached resolved parent instance holding the health value/property
 	ui = { statusLabel = nil, listLabel = nil },
 }
 
@@ -4140,6 +4687,12 @@ function AutoLearn.setIds(list)
 	GameData.data.autoLearnIds = list
 	GameData.save()
 	AutoLearn.updateListLabel()
+end
+
+---Configured HP path (persisted per game).
+---@return string
+function AutoLearn.healthPath()
+	return GameData.data.autoLearnHealthPath or ""
 end
 
 ---@param list string[]
@@ -4171,14 +4724,6 @@ end
 
 ---@param p table
 local function dropPending(p)
-	if p.conn then
-		pcall(function()
-			p.conn:Disconnect()
-		end)
-
-		p.conn = nil
-	end
-
 	AutoLearn.pending[p.track] = nil
 end
 
@@ -4190,40 +4735,80 @@ local function learnOption(name, fallback)
 	return (Options and Options[name] and Options[name].Value) or fallback
 end
 
----Called when a watched animation track stops.
----@param track AnimationTrack
-function AutoLearn.onStopped(track)
-	local p = AutoLearn.pending[track]
+---Read the local player's health. Blank path -> LocalPlayer Humanoid.Health, otherwise
+---resolve a dotted path (PLAYERNAME substitutes the local player name). Returns nil on failure.
+---@return number?
+function AutoLearn.readHealth()
+	local path = AutoLearn.healthPath()
 
-	if not p then
-		return
+	if path == "" then
+		local ok, result = pcall(function()
+			local character = localPlayer and localPlayer.Character
+
+			if not character then
+				return nil
+			end
+
+			local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+			return humanoid and humanoid.Health or nil
+		end)
+
+		return ok and result or nil
 	end
 
-	dropPending(p)
+	local root, segments = parseInstancePath(path)
 
-	if not p.pressAt then
-		AutoLearn.status("'%s' ended without a press", p.animName)
-		return
+	if not root or #segments == 0 then
+		return nil
 	end
 
-	if os.clock() - p.pressAt > learnOption("AutoLearnCancelWindow", 400) / 1000 then
-		AutoLearn.status("'%s' ended too late after press (not a parry)", p.animName)
-		return
+	-- Re-resolve the cached parent when it is missing or was destroyed (respawn).
+	if not AutoLearn.healthParent or AutoLearn.healthParent.Parent == nil then
+		local resolved = nil
+
+		pcall(function()
+			local current = root
+
+			for index = 1, #segments - 1 do
+				if not current then
+					return
+				end
+
+				current = current:FindFirstChild(segments[index])
+			end
+
+			resolved = current
+		end)
+
+		AutoLearn.healthParent = resolved
 	end
 
-	-- Early-end check: a parried animation stops before its natural end.
-	local early = true
+	local parent = AutoLearn.healthParent
 
-	pcall(function()
-		early = track.Looped or track.Length <= 0 or (track.TimePosition < track.Length - 0.05)
+	if not parent then
+		return nil
+	end
+
+	local last = segments[#segments]
+
+	local ok, result = pcall(function()
+		local target = parent:FindFirstChild(last)
+
+		if target and target:IsA("ValueBase") then
+			return target.Value
+		end
+
+		local value = parent[last]
+
+		if type(value) == "number" then
+			return value
+		end
+
+		return nil
 	end)
 
-	if not early then
-		AutoLearn.status("'%s' played fully (not a parry)", p.animName)
-		return
-	end
-
-	AutoLearn.commit(p)
+	return ok and result or nil
 end
 
 ---Commit a learned sample into a timing.
@@ -4318,8 +4903,8 @@ function AutoLearn.commit(p)
 		refreshAllSections()
 	end
 
-	Logger.notify("Auto Learn: %s -> delay %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
-	AutoLearn.status("'%s' -> %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
+	Logger.notify("Auto Learn hit: %s -> delay %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
+	AutoLearn.status("'%s' hit -> %d ms, hitbox %.1f (n=%d)", p.animName, avgDelay, size, count)
 end
 
 ---Handle an entity animation for auto learning.
@@ -4352,31 +4937,55 @@ function AutoLearn.onAnimation(entity, track)
 		startedAt = os.clock(),
 	}
 
-	p.conn = track.Stopped:Connect(function()
-		AutoLearn.onStopped(track)
-	end)
-
 	AutoLearn.pending[track] = p
 
-	local pressWindow = learnOption("AutoLearnPressWindow", 1500)
-	local cancelWindow = learnOption("AutoLearnCancelWindow", 400)
-	local length = 0
-
-	pcall(function()
-		length = track.Length
-	end)
-
-	task.delay((pressWindow + cancelWindow) / 1000 + math.max(length, 0) + 1, function()
+	-- Keep the pending alive for the whole damage window: the hit can land after
+	-- the animation track has already stopped.
+	task.delay(learnOption("AutoLearnDamageWindow", 2000) / 1000 + 0.1, function()
 		if AutoLearn.pending[track] == p then
 			dropPending(p)
-			AutoLearn.status("'%s' watch timed out", p.animName)
+			AutoLearn.status("'%s' - no HP change within window", p.animName)
 		end
 	end)
 end
 
----Start listening for manual parry presses.
+---Called when the polled HP changes; commits the most recent qualifying pending.
+function AutoLearn.onHealthChanged()
+	local now = os.clock()
+	local damageWindow = learnOption("AutoLearnDamageWindow", 2000)
+	local best = nil
+
+	for _, p in next, AutoLearn.pending do
+		if p.hitAt or now - p.startedAt > damageWindow / 1000 then
+			continue
+		end
+
+		local distance = entityDistance(p.entity)
+
+		if distance == nil then
+			continue
+		end
+
+		if not best or p.startedAt > best.startedAt then
+			best = p
+		end
+	end
+
+	if not best then
+		return
+	end
+
+	best.hitAt = now
+	best.delayMs = math.floor((now - best.startedAt) * 1000 + 0.5)
+	best.distance = entityDistance(best.entity)
+
+	dropPending(best)
+	AutoLearn.commit(best)
+end
+
+---Start polling the local player's HP.
 function AutoLearn.start()
-	AutoLearn.maid:mark(userInputService.InputBegan:Connect(function(input)
+	AutoLearn.maid:mark(runService.Heartbeat:Connect(function()
 		if UNLOADED then
 			return
 		end
@@ -4385,38 +4994,20 @@ function AutoLearn.start()
 			return
 		end
 
-		local keyName = (Options and Options.ParryKey and Options.ParryKey.Value) or "F"
-		local matched = false
+		local health = AutoLearn.readHealth()
+		local last = AutoLearn.lastHealth
+		AutoLearn.lastHealth = health
 
-		if keyName == "MB1" then
-			matched = input.UserInputType == Enum.UserInputType.MouseButton1
-		elseif keyName == "MB2" then
-			matched = input.UserInputType == Enum.UserInputType.MouseButton2
-		else
-			matched = input.KeyCode and input.KeyCode.Name == keyName
-		end
-
-		if not matched then
+		if health == nil or last == nil then
+			-- Respawn / unreadable: next valid read must not register as a change.
 			return
 		end
 
-		local now = os.clock()
-		local pressWindow = learnOption("AutoLearnPressWindow", 1500)
+		local changed = health ~= last
+		local anyChange = Toggles and Toggles.AutoLearnAnyChange and Toggles.AutoLearnAnyChange.Value
 
-		for _, p in next, AutoLearn.pending do
-			if p.pressAt or now - p.startedAt > pressWindow / 1000 then
-				continue
-			end
-
-			local distance = entityDistance(p.entity)
-
-			if distance == nil then
-				continue
-			end
-
-			p.pressAt = now
-			p.delayMs = math.floor((now - p.startedAt) * 1000 + 0.5)
-			p.distance = distance
+		if changed and (anyChange or health < last) then
+			AutoLearn.onHealthChanged()
 		end
 	end))
 end
@@ -4427,6 +5018,8 @@ function AutoLearn.stop()
 		dropPending(p)
 	end
 
+	AutoLearn.lastHealth = nil
+	AutoLearn.healthParent = nil
 	AutoLearn.maid:clean()
 end
 
@@ -4487,6 +5080,10 @@ function Defense.execute(action, timing, entity)
 		task.spawn(Input.pressKey, action.key or "F")
 	elseif actionType == "Remote" then
 		local template = action.remote and GameDataRemotes()[action.remote]
+
+		if action.remote and GameDataRemotesDisabled()[action.remote] then
+			template = nil
+		end
 
 		if template then
 			RemoteResolver.fire(template)
@@ -5860,12 +6457,24 @@ local RemoteUI = {
 local function updateRemoteLabels()
 	if RemoteUI.parryLabel then
 		local template = GameDataRemotes()["Parry"]
-		RemoteUI.parryLabel:SetText("Parry remote: " .. (template and template.path or "none"))
+		local text = "Parry remote: " .. (template and template.path or "none")
+
+		if template and GameDataRemotesDisabled()["Parry"] then
+			text = text .. " (disabled)"
+		end
+
+		RemoteUI.parryLabel:SetText(text)
 	end
 
 	if RemoteUI.dodgeLabel then
 		local template = GameDataRemotes()["Dodge"]
-		RemoteUI.dodgeLabel:SetText("Dodge remote: " .. (template and template.path or "none"))
+		local text = "Dodge remote: " .. (template and template.path or "none")
+
+		if template and GameDataRemotesDisabled()["Dodge"] then
+			text = text .. " (disabled)"
+		end
+
+		RemoteUI.dodgeLabel:SetText(text)
 	end
 end
 
@@ -6023,28 +6632,59 @@ local function buildCombatTab(tab)
 	RemoteUI.parryLabel = remoteBox:AddLabel("Parry remote: none")
 	RemoteUI.dodgeLabel = remoteBox:AddLabel("Dodge remote: none")
 
-	remoteBox:AddButton({
-		Text = "Clear Parry Remote",
-		Func = function()
-			GameDataRemotes()["Parry"] = nil
-			GameData.save()
-			updateRemoteLabels()
-		end,
-	})
+	remoteBox
+		:AddButton({
+			Text = "Stop Using Parry Remote",
+			Func = function()
+				GameDataRemotesDisabled()["Parry"] = true
+				GameData.save()
+				updateRemoteLabels()
+			end,
+		})
+		:AddButton({
+			Text = "Use Parry Remote",
+			Func = function()
+				GameDataRemotesDisabled()["Parry"] = nil
+				GameData.save()
+				updateRemoteLabels()
+			end,
+		})
+
+	remoteBox
+		:AddButton({
+			Text = "Stop Using Dodge Remote",
+			Func = function()
+				GameDataRemotesDisabled()["Dodge"] = true
+				GameData.save()
+				updateRemoteLabels()
+			end,
+		})
+		:AddButton({
+			Text = "Use Dodge Remote",
+			Func = function()
+				GameDataRemotesDisabled()["Dodge"] = nil
+				GameData.save()
+				updateRemoteLabels()
+			end,
+		})
 
 	remoteBox:AddButton({
-		Text = "Clear Dodge Remote",
+		Text = "Delete Saved Remotes",
 		Func = function()
+			GameDataRemotes()["Parry"] = nil
 			GameDataRemotes()["Dodge"] = nil
+			GameDataRemotesDisabled()["Parry"] = nil
+			GameDataRemotesDisabled()["Dodge"] = nil
 			GameData.save()
 			updateRemoteLabels()
+			Logger.notify("Saved remotes deleted.")
 		end,
 	})
 
 	remoteBox:AddDivider()
 
 	remoteBox:AddInput("RC_ManualPath", {
-		Text = "Manual Remote Path",
+		Text = 'Manual Remote Path (game:GetService("X").A.B OK)',
 	})
 
 	remoteBox:AddDropdown("RC_ManualMethod", {
@@ -6054,7 +6694,7 @@ local function buildCombatTab(tab)
 	})
 
 	remoteBox:AddInput("RC_ManualArgs", {
-		Text = "Manual Args (Lua table)",
+		Text = "Manual Args (Lua table; $AIM_POS, $ENUM:X.Y, $LOCALPLAYER ok)",
 	})
 
 	remoteBox:AddButton({
@@ -6095,6 +6735,114 @@ local function buildCombatTab(tab)
 
 			RemoteResolver.fire(template)
 		end,
+	})
+end
+
+---Build the Game tab.
+---@param tab table
+local function buildGameTab(tab)
+	local movementBox = tab:AddLeftGroupbox("Movement")
+
+	local flyToggle = movementBox:AddToggle("Fly", {
+		Text = "Fly",
+		Tooltip = "Set your character's velocity while moving to imitate flying.",
+		Default = false,
+	})
+
+	flyToggle:AddKeyPicker("FlyKeybind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "Fly",
+	})
+
+	local flyDepBox = movementBox:AddDependencyBox()
+
+	flyDepBox:AddSlider("FlySpeed", {
+		Text = "Fly Speed",
+		Default = 200,
+		Min = 0,
+		Max = 450,
+		Suffix = "/s",
+		Rounding = 0,
+	})
+
+	flyDepBox:AddSlider("FlyUpSpeed", {
+		Text = "Spacebar Fly Speed",
+		Default = 150,
+		Min = 0,
+		Max = 450,
+		Suffix = "/s",
+		Rounding = 0,
+	})
+
+	flyDepBox:SetupDependencies({
+		{ flyToggle, true },
+	})
+
+	local noclipToggle = movementBox:AddToggle("NoClip", {
+		Text = "NoClip",
+		Tooltip = "Disable collision(s) for your character.",
+		Default = false,
+	})
+
+	noclipToggle:AddKeyPicker("NoClipKeybind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "NoClip",
+	})
+
+	local exploitBox = tab:AddRightGroupbox("Exploits")
+
+	local voidMobsToggle = exploitBox:AddToggle("VoidMobs", {
+		Text = "Void Mobs",
+		Tooltip = "Teleport nearby mobs and send them to the void.",
+		Default = false,
+	})
+
+	voidMobsToggle:AddKeyPicker("VoidMobsKeyBind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "Void Mobs",
+	})
+
+	local pathfindBreakerToggle = exploitBox:AddToggle("PathfindBreaker", {
+		Text = "Pathfind Breaker",
+		Tooltip = "Visibly break the pathfinding for humanoid mobs by attempting to spoof your vertical velocity.",
+		Default = false,
+	})
+
+	pathfindBreakerToggle:AddKeyPicker("PathfindBreakerKeyBind", {
+		Default = "N/A",
+		SyncToggleState = true,
+		Text = "Pathfind Breaker",
+	})
+
+	local pbDepBox = exploitBox:AddDependencyBox()
+
+	pbDepBox:AddToggle("AggressiveMode", {
+		Text = "Aggressive Mode",
+		Tooltip = "Enable this to make the pathfinding breaker more aggressive by luring mobs towards you.",
+		Default = false,
+	})
+
+	local pbHighlightToggle = pbDepBox:AddToggle("PathfindBreakerHighlight", {
+		Text = "Show Highlight",
+		Tooltip = "Because this feature can be very visible, you can enable a visual highlight to see if it is on.",
+		Default = false,
+	})
+
+	pbHighlightToggle:AddColorPicker("PathfindBreakerHighlightColor", {
+		Default = Color3.fromRGB(200, 0, 255),
+		Text = "Highlight Color",
+	})
+
+	pbHighlightToggle:AddColorPicker("PathfindBreakerHighlightOutlineColor", {
+		Default = Color3.fromRGB(255, 152, 234),
+		Text = "Outline Color",
+	})
+
+	pbDepBox:SetupDependencies({
+		{ pathfindBreakerToggle, true },
 	})
 end
 
@@ -6546,19 +7294,26 @@ local function buildToolsTab(tab)
 
 	AutoLearn.ui.listLabel = learnBox:AddLabel(string.format("Watching: %d IDs", #AutoLearn.ids()))
 
-	learnBox:AddSlider("AutoLearnPressWindow", {
-		Text = "Press Window (ms)",
-		Min = 100,
-		Max = 3000,
-		Default = 1500,
-		Rounding = 0,
+	learnBox:AddInput("AutoLearnHealthPath", {
+		Text = "HP Path (blank = LocalPlayer Humanoid.Health; game:GetService(...) paths OK)",
+		Default = AutoLearn.healthPath(),
+		Callback = function(value)
+			GameData.data.autoLearnHealthPath = tostring(value)
+			GameData.save()
+			AutoLearn.healthParent = nil
+		end,
 	})
 
-	learnBox:AddSlider("AutoLearnCancelWindow", {
-		Text = "Cancel Window (ms)",
-		Min = 50,
-		Max = 1500,
-		Default = 400,
+	learnBox:AddToggle("AutoLearnAnyChange", {
+		Text = "Count Any HP Change (not just damage)",
+		Default = false,
+	})
+
+	learnBox:AddSlider("AutoLearnDamageWindow", {
+		Text = "Damage Window (ms)",
+		Min = 100,
+		Max = 5000,
+		Default = 2000,
 		Rounding = 0,
 	})
 
@@ -6577,7 +7332,9 @@ local function buildToolsTab(tab)
 
 	AutoLearn.ui.statusLabel = learnBox:AddLabel("Status: idle")
 
-	learnBox:AddLabel("Tip: disable Auto Parry while learning.")
+	learnBox:AddLabel(
+		"Get hit by the watched animation; delay = animation start -> HP change, hitbox = NPC distance at the hit."
+	)
 
 	local infoBox = tab:AddRightGroupbox("Info")
 
@@ -6714,6 +7471,7 @@ local function unload()
 		DifferenceCalculator.maid:clean()
 	end)
 	pcall(AutoLearn.stop)
+	pcall(Movement.stop)
 	pcall(function()
 		for _, state in next, Entities.tracked do
 			state.maid:clean()
@@ -6759,11 +7517,13 @@ local function init()
 	})
 
 	local combatTab = Window:AddTab("Combat")
+	local gameTab = Window:AddTab("Game")
 	local builderTab = Window:AddTab("Builder")
 	local toolsTab = Window:AddTab("Tools")
 	local settingsTab = Window:AddTab("Settings")
 
 	buildCombatTab(combatTab)
+	buildGameTab(gameTab)
 	builderUI = buildBuilderTab(builderTab)
 	buildToolsTab(toolsTab)
 	buildSettingsTab(settingsTab)
@@ -6779,6 +7539,7 @@ local function init()
 	DifferenceCalculator.start()
 	AutoLearn.start()
 	Entities.start()
+	Movement.start()
 
 	rootMaid:mark(runService.Heartbeat:Connect(onHeartbeat))
 	rootMaid:mark(runService.RenderStepped:Connect(InfoLogger.renderStepped))
@@ -6786,6 +7547,7 @@ local function init()
 	rootMaid:mark(Entities.maid)
 	rootMaid:mark(DifferenceCalculator.maid)
 	rootMaid:mark(AutoLearn.maid)
+	rootMaid:mark(Movement.maid)
 
 	Library:OnUnload(unload)
 
