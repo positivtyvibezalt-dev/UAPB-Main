@@ -2833,25 +2833,38 @@ local function hookEntity(entity)
 	end))
 end
 
+---Should an entity be hooked, given the Only Target Players / Ignore Players filters?
+---@param model Model
+---@return boolean
+function Entities.shouldTrack(model)
+	if not isEntity(model) or model == (localPlayer and localPlayer.Character) then
+		return false
+	end
+
+	if not Toggles then
+		return true
+	end
+
+	local isPlayer = isPlayerEntity(model)
+
+	if Toggles.IgnorePlayers and Toggles.IgnorePlayers.Value and isPlayer then
+		return false
+	end
+
+	if Toggles.OnlyTargetPlayers and Toggles.OnlyTargetPlayers.Value and not isPlayer then
+		return false
+	end
+
+	return true
+end
+
 ---Initial scan + watch for new entities.
 function Entities.start()
-	local localCharacter = localPlayer and localPlayer.Character
-
 	for _, inst in next, workspace:GetDescendants() do
 		if inst:IsA("Humanoid") then
 			local model = inst.Parent
 
-			if
-				isEntity(model)
-				and model ~= localCharacter
-				and not Entities.tracked[model]
-				and not (
-					Toggles
-					and Toggles.OnlyTargetPlayers
-					and Toggles.OnlyTargetPlayers.Value
-					and not isPlayerEntity(model)
-				)
-			then
+			if not Entities.tracked[model] and Entities.shouldTrack(model) then
 				hookEntity(model)
 			end
 		end
@@ -2865,16 +2878,7 @@ function Entities.start()
 		task.defer(function()
 			local model = inst.Parent
 
-			if not isEntity(model) or model == (localPlayer and localPlayer.Character) then
-				return
-			end
-
-			if
-				Toggles
-				and Toggles.OnlyTargetPlayers
-				and Toggles.OnlyTargetPlayers.Value
-				and not isPlayerEntity(model)
-			then
+			if Entities.tracked[model] or not Entities.shouldTrack(model) then
 				return
 			end
 
@@ -2900,7 +2904,7 @@ end
 ---Re-scan workspace for entities (e.g. after respawn).
 function Entities.rescan()
 	for model, state in next, Entities.tracked do
-		if not model:IsDescendantOf(workspace) then
+		if not model:IsDescendantOf(workspace) or not Entities.shouldTrack(model) then
 			state.maid:clean()
 			Entities.tracked[model] = nil
 		end
@@ -6598,11 +6602,17 @@ local function buildCombatTab(tab)
 	detectionBox:AddToggle("OnlyTargetPlayers", {
 		Text = "Only Target Players",
 		Default = false,
-		Callback = function(value)
-			if not value then
-				-- Re-hook NPCs without needing a script re-run.
-				Entities.rescan()
-			end
+		Callback = function()
+			Entities.rescan()
+		end,
+	})
+
+	detectionBox:AddToggle("IgnorePlayers", {
+		Text = "Ignore Players",
+		Tooltip = "Skip animations/sounds/effects from player characters in the logger and auto defense.",
+		Default = false,
+		Callback = function()
+			Entities.rescan()
 		end,
 	})
 
